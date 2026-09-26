@@ -14,13 +14,15 @@ the server runs as a supervised child process:
 ```
 MCP client ──HTTPS + bearer token──> reverse proxy ──> mcp-obsidian
                                                             │
-                                              reads/writes  │ supervises
-                                                    ▼        ▼
-                                                 ~/vault   ob sync --continuous
-                                                    ▲
-                                                 Obsidian Sync
-                                                    │
-                                     your desktop / phone / tablet
+                                    ┌──── reads/writes ─────┴─ supervises ─┐
+                                    ▼                                      ▼
+                                 ~/vault                          ob sync --continuous
+                                    ▲                                      │
+                                    └─────────────── syncs ────────────────┤
+                                                                           │
+                                                                 Obsidian Sync (cloud)
+                                                                           │
+                                                             your desktop / phone / tablet
 ```
 
 The server reads and writes the vault directory directly, so tool calls are
