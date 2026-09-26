@@ -385,6 +385,18 @@ pub fn extract_section(body: &str, heading: &str) -> Option<String> {
     Some(section.trim_end().to_string())
 }
 
+/// Comma-joined heading texts of a body, for "heading not found" error
+/// messages: heading matches are case-insensitive on the text alone, so
+/// naming the real headings lets a client retry with a valid one instead
+/// of guessing.
+pub fn heading_names(body: &str) -> String {
+    parse_headings(body)
+        .iter()
+        .map(|h| h.text.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Percent-decodes a link target (Obsidian URL-encodes spaces and special
 /// characters in markdown links, e.g. `My%20Note.md`).
 pub fn percent_decode(input: &str) -> String {
@@ -543,5 +555,188 @@ mod tests {
         assert_eq!(percent_decode("My%20Note.md"), "My Note.md");
         assert_eq!(percent_decode("plain.md"), "plain.md");
         assert_eq!(percent_decode("bad%2"), "bad%2");
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    //! Property-based tests (quickcheck). These pin invariants that must
+    //! hold for *arbitrary* input, not just hand-picked shapes. The
+    //! parsers hand out byte spans that the write side splices blindly,
+    //! so a span that is not a real token — or a frontmatter split that
+    //! is not a clean prefix split — would corrupt notes.
+
+    use super::*;
+    use quickcheck::{Arbitrary, Gen};
+
+    /// Fragment pool the [`Soup`] generator draws from: every bracket
+    /// shape the regexes care about, fences, inline code, frontmatter
+    /// fences, BOMs, CRLFs, tags, and a few concrete link forms. Pure
+    /// random Unicode almost never produces these combinations; sampling
+    /// this pool drives the parsers through the nested, unbalanced, and
+    /// pathological inputs that matter here.
+    const FRAGMENTS: &[&str] = &[
+        "[[",
+        "]]",
+        "![",
+        "[",
+        "]",
+        "(",
+        ")",
+        "|",
+        "#",
+        "#^",
+        "^",
+        " ",
+        "\n",
+        "\r\n",
+        "`",
+        "```",
+        "~~~",
+        "---",
+        "\u{feff}",
+        "old",
+        "sub",
+        "/",
+        ".md",
+        "#tag",
+        "[[old]]",
+        "[[old.md]]",
+        "![[old|a#h]]",
+        "[x](old.md)",
+        "[[a|b]](c)",
+    ];
+
+    /// A random concatenation of pool fragments and arbitrary Unicode,
+    /// with a BOM up front about half the time.
+    #[derive(Clone, Debug)]
+    struct Soup(pub String);
+
+    impl Arbitrary for Soup {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let n = usize::arbitrary(g) % 48;
+            let mut s = String::new();
+            if bool::arbitrary(g) {
+                s.push('\u{feff}');
+            }
+            for _ in 0..n {
+                if bool::arbitrary(g) {
+                    s.push(char::arbitrary(g));
+                } else {
+                    s.push_str(g.choose(FRAGMENTS).expect("pool is non-empty"));
+                }
+            }
+            Soup(s)
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            // Halve by chars (never slicing through a multi-byte char);
+            // quickcheck walks this down to a minimal counterexample.
+            let half = self.0.chars().count() / 2;
+            let mut smaller = Vec::new();
+            if half > 0 {
+                smaller.push(Soup(self.0.chars().take(half).collect()));
+                smaller.push(Soup(self.0.chars().skip(half).collect()));
+            }
+            smaller.push(Soup(String::new()));
+            Box::new(smaller.into_iter())
+        }
+    }
+
+    quickcheck::quickcheck! {
+        /// The frontmatter split is a clean prefix split: a detected block
+        /// is a fenced prefix of the raw text and the body is exactly the
+        /// remainder. This is what lets `patch_note` splice the block back
+        /// byte-for-byte.
+        fn frontmatter_split_is_a_prefix_split(raw: String) -> bool {
+            let (fm, body) = split_frontmatter(&raw);
+            match fm {
+                Some(fm) => {
+                    raw.starts_with(fm)
+                        && &raw[fm.len()..] == body
+                        && (fm.starts_with("---\n") || fm.starts_with("---\r\n"))
+                }
+                None => body == raw,
+            }
+        }
+
+        /// `blank_code` preserves byte length (so spans measured on the
+        /// blanked text stay valid in the original) and the CR/LF
+        /// structure (so line-based consumers agree on both texts).
+        fn blank_code_preserves_shape(raw: Soup) -> bool {
+            let Soup(raw) = raw;
+            let blanked = blank_code(&raw);
+            blanked.len() == raw.len()
+                && blanked.matches('\n').count() == raw.matches('\n').count()
+                && blanked.matches('\r').count() == raw.matches('\r').count()
+        }
+
+        /// Blanking is idempotent: a blanked text has no code left to
+        /// blank (fences were consumed with their lines, and the inline
+        /// delimiters that remain re-pair to the same spans).
+        fn blank_code_is_idempotent(raw: Soup) -> bool {
+            let Soup(raw) = raw;
+            let once = blank_code(&raw);
+            blank_code(&once) == once
+        }
+
+        /// Every span a parser reports is a slice of the original text
+        /// that really is that token, same-kind spans never overlap, and
+        /// no parser panics on any input. The write side splices these
+        /// spans blindly; a bogus span would corrupt notes.
+        fn spans_point_at_real_tokens(raw: Soup) -> bool {
+            let Soup(raw) = raw;
+            let (fm, body) = split_frontmatter(&raw);
+            // Any frontmatter must survive YAML handling without panicking
+            // (malformed YAML is a `None`, never an error).
+            if let Some(fm) = fm
+                && let Some(value) = parse_yaml(fm)
+            {
+                frontmatter_string_list(&value, "tags");
+            }
+            let mut ok = true;
+
+            let mut last_end = 0;
+            for link in parse_wikilinks(&raw) {
+                let token = &raw[link.span.clone()];
+                ok &= link.span.start >= last_end;
+                last_end = link.span.end;
+                ok &= token.starts_with(if link.embed { "![[" } else { "[[" });
+                ok &= token.ends_with("]]");
+            }
+
+            let mut last_end = 0;
+            for link in parse_md_links(body) {
+                let token = &body[link.span.clone()];
+                ok &= link.span.start >= last_end;
+                last_end = link.span.end;
+                ok &= token.starts_with(if link.embed { "![" } else { "[" });
+                ok &= token.ends_with(')');
+                ok &= token.contains("](");
+            }
+
+            for heading in parse_headings(body) {
+                ok &= body[heading.span.clone()].trim_start().starts_with('#');
+                ok &= (1..=6).contains(&heading.level);
+            }
+
+            for tag in parse_body_tags(body) {
+                // Obsidian tag rules: non-empty, no '#', starts on a word
+                // character, never all digits, no trailing '-'/'/'.
+                ok &= !tag.is_empty();
+                ok &= !tag.contains('#');
+                let first = tag.chars().next().expect("checked non-empty");
+                ok &= first.is_alphabetic() || first.is_numeric() || first == '_';
+            }
+
+            // Section extraction returns a contiguous slice of the body.
+            if let Some(heading) = parse_headings(body).first()
+                && let Some(section) = extract_section(body, &heading.text)
+            {
+                ok &= body.contains(&section);
+            }
+
+            ok
+        }
     }
 }

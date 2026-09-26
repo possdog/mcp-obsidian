@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use crate::notes::Notes;
 use crate::search::SearchIndex;
 use crate::sync::{self, SyncSupervisor};
-use crate::vault::Vault;
+use crate::vault::{Vault, VaultError};
 use crate::writes::{DailyAction, DailyNoteSettings, PatchOp, WriteOutcome, Writes};
 
 /// Cap on a tool's text response, protecting client context windows from
@@ -125,17 +125,24 @@ struct ObsidianHandler {
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 struct ListNotesArgs {
-    /// Only list notes whose vault-relative path starts with this prefix.
+    /// Only list files whose vault-relative path starts with this prefix
+    /// (case-sensitive, unlike search_notes' prefix).
     prefix: Option<String>,
+    /// Maximum number of files to return (1-1000). On large vaults the
+    /// full listing is truncated at 256 KiB; results are sorted by path,
+    /// so combine this with prefix to page.
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 struct ReadNoteArgs {
-    /// Vault-relative path of the note (e.g. "journal/2026-09-25.md").
+    /// Vault-relative path of the note, or a bare note name (".md" is
+    /// optional), e.g. "journal/2026-09-25.md" or "Journal/2026-09-25".
     path: String,
-    /// Optional heading: return only that section instead of the whole note
-    /// (case-insensitive).
+    /// Return only this heading's section: the heading line through any
+    /// nested subsections, up to the next heading of the same or higher
+    /// level (case-insensitive). Frontmatter is not included.
     heading: Option<String>,
 }
 
@@ -163,7 +170,8 @@ struct SearchNotesArgs {
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 struct WriteNoteArgs {
-    /// Vault-relative path of the note to create or replace.
+    /// Vault-relative path of the note to create or replace, including
+    /// the extension (e.g. "ideas/new-idea.md").
     path: String,
     /// Full note content. When `frontmatter` is given, this is the body
     /// only — anything frontmatter-shaped in it would land in the body.
@@ -177,16 +185,19 @@ struct WriteNoteArgs {
     overwrite: Option<bool>,
 }
 
-#[derive(Deserialize, schemars::JsonSchema, Default)]
-#[serde(default)]
+// No container-level `serde(default)`: `operation`, `path`, and `content`
+// are required, and rmcp turns a missing field into a tool-level error
+// naming it.
+#[derive(Deserialize, schemars::JsonSchema)]
 struct PatchNoteArgs {
-    /// Vault-relative path of the note to edit.
+    /// Vault-relative path of the note to edit, or a bare note name
+    /// (".md" is optional).
     path: String,
-    /// One of: "append", "prepend", "insert_at_heading",
-    /// "replace_section".
-    operation: String,
-    /// The text to add. May be empty only for "replace_section", which
-    /// then clears the section's content (the heading line is kept).
+    /// How to modify the note.
+    operation: PatchOp,
+    /// The text to add, or the section's new content for
+    /// "replace_section" (empty content clears the section, keeping the
+    /// heading line).
     content: String,
     /// Target heading (case-insensitive); required for
     /// "insert_at_heading" and "replace_section".
@@ -196,9 +207,11 @@ struct PatchNoteArgs {
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 struct MoveNoteArgs {
-    /// Current vault-relative path of the note (or file).
+    /// Current vault-relative path of the note (or file); a bare note
+    /// name also works (".md" is optional).
     from: String,
-    /// New vault-relative path.
+    /// New vault-relative path, exactly as it should be written,
+    /// including the file extension.
     to: String,
     /// Replace the destination if it already exists (default: refuse).
     overwrite: Option<bool>,
@@ -211,18 +224,20 @@ struct MoveNoteArgs {
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 struct DeleteNoteArgs {
-    /// Vault-relative path of the note to delete.
+    /// Vault-relative path of the note to delete, or a bare note name
+    /// (".md" is optional).
     path: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 struct DailyNoteArgs {
-    /// One of: "get" (default), "create", "append".
-    action: Option<String>,
-    /// The day as YYYY-MM-DD. Defaults to today (UTC).
+    /// What to do with the day's note (default: "get").
+    action: Option<DailyAction>,
+    /// The day as YYYY-MM-DD. Defaults to today (UTC); pass an explicit
+    /// date when the exact day matters.
     date: Option<String>,
-    /// Note content for "create"; the text to append for "append"
+    /// Initial content for "create"; the text to append for "append"
     /// (required for append).
     content: Option<String>,
 }
@@ -231,14 +246,20 @@ struct DailyNoteArgs {
 impl ObsidianHandler {
     #[tool(
         name = "list_notes",
-        description = "List notes in the vault with size and modification time, optionally under a path prefix."
+        description = "List every file in the vault (notes and attachments), sorted by vault-relative path, one \"- path (bytes, mtime)\" line each. prefix narrows to a folder; use limit to page large vaults — a full listing is truncated at 256 KiB."
     )]
     async fn list_notes(
         &self,
         Parameters(args): Parameters<ListNotesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Clamp rather than reject: absurd limits are a modeling artifact,
+        // not a user decision worth a round trip.
+        let limit = args.limit.map(|l| l.clamp(1, 1000));
         let entries = match self.ctx.notes.list(args.prefix.as_deref()) {
-            Ok(entries) => entries,
+            Ok(entries) => match limit {
+                Some(l) => entries.into_iter().take(l).collect(),
+                None => entries,
+            },
             Err(e) => return tool_error(e),
         };
         let mut out = String::new();
@@ -264,13 +285,17 @@ impl ObsidianHandler {
 
     #[tool(
         name = "read_note",
-        description = "Read a note's full content (frontmatter included), or only one heading's section."
+        description = "Read a note's full content (frontmatter included), or only one heading's section (the heading line through its subsections, up to the next heading of the same or higher level; frontmatter excluded). Accepts a vault-relative path or a bare note name (\".md\" optional); heading match is case-insensitive."
     )]
     async fn read_note(
         &self,
         Parameters(args): Parameters<ReadNoteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let read = match self.ctx.notes.read(&args.path, args.heading.as_deref()) {
+        let path = match resolve_note_path(self.ctx.notes.vault(), &args.path) {
+            Ok(path) => path,
+            Err(e) => return tool_error(e),
+        };
+        let read = match self.ctx.notes.read(&path, args.heading.as_deref()) {
             Ok(read) => read,
             Err(e) => return tool_error(e),
         };
@@ -287,7 +312,7 @@ impl ObsidianHandler {
 
     #[tool(
         name = "get_backlinks",
-        description = "List notes that link to a given note."
+        description = "List the notes that link to a given note, one \"- source path (link display text)\" line per linking note. Accepts a bare note name (\".md\" optional)."
     )]
     async fn get_backlinks(
         &self,
@@ -297,9 +322,9 @@ impl ObsidianHandler {
             Ok(index) => index,
             Err(e) => return tool_error(e),
         };
-        let key = match note_key(&self.ctx.notes, &args.path) {
-            Some(key) => key,
-            None => return tool_error(format!("note not found: {}", args.path)),
+        let key = match resolve_note_path(self.ctx.notes.vault(), &args.path) {
+            Ok(key) => key,
+            Err(e) => return tool_error(e),
         };
         let backlinks = index.backlinks(&key);
         if backlinks.is_empty() {
@@ -314,7 +339,7 @@ impl ObsidianHandler {
 
     #[tool(
         name = "get_outlinks",
-        description = "List the links a given note points to."
+        description = "List the links a given note points to, one \"- target path [link|embed] (display text)\" line per link. Accepts a bare note name (\".md\" optional)."
     )]
     async fn get_outlinks(
         &self,
@@ -324,9 +349,9 @@ impl ObsidianHandler {
             Ok(index) => index,
             Err(e) => return tool_error(e),
         };
-        let key = match note_key(&self.ctx.notes, &args.path) {
-            Some(key) => key,
-            None => return tool_error(format!("note not found: {}", args.path)),
+        let key = match resolve_note_path(self.ctx.notes.vault(), &args.path) {
+            Ok(key) => key,
+            Err(e) => return tool_error(e),
         };
         let outlinks = index.outlinks(&key);
         if outlinks.is_empty() {
@@ -342,7 +367,7 @@ impl ObsidianHandler {
 
     #[tool(
         name = "list_tags",
-        description = "List all tags in the vault with the number of notes carrying each."
+        description = "List all tags in the vault (frontmatter and body) with the number of notes carrying each, sorted by count then name."
     )]
     async fn list_tags(&self) -> Result<CallToolResult, ErrorData> {
         let tags = match self.ctx.notes.list_tags() {
@@ -361,7 +386,7 @@ impl ObsidianHandler {
 
     #[tool(
         name = "search_notes",
-        description = "Full-text search across the vault (note bodies, titles, aliases, tags, and frontmatter). Returns matching paths ranked by relevance with snippets."
+        description = "Full-text search across the vault (note bodies, titles, aliases, tags, and frontmatter). Returns up to `limit` matches, ranked by relevance, as numbered entries with path, title, and a matching snippet — use read_note to open a hit."
     )]
     async fn search_notes(
         &self,
@@ -398,7 +423,7 @@ impl ObsidianHandler {
 
     #[tool(
         name = "write_note",
-        description = "Create or overwrite a note, optionally with YAML frontmatter. Refuses to replace an existing note unless overwrite is true."
+        description = "Create a note, or replace an existing one when overwrite=true. overwrite=true replaces the ENTIRE note; to edit part of an existing note, prefer patch_note (it preserves frontmatter and untouched sections). For today's journal entry, prefer daily_note."
     )]
     async fn write_note(
         &self,
@@ -418,26 +443,19 @@ impl ObsidianHandler {
 
     #[tool(
         name = "patch_note",
-        description = "Edit part of a note: append, prepend, insert under a heading, or replace a heading's section. Existing frontmatter is preserved untouched."
+        description = "Edit part of an existing note — append, prepend, insert under a heading, or replace a heading's section — preserving frontmatter and untouched sections. Prefer this over write_note for edits: write_note with overwrite=true replaces the whole file."
     )]
     async fn patch_note(
         &self,
         Parameters(args): Parameters<PatchNoteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let operation = match args.operation.as_str() {
-            "append" => PatchOp::Append,
-            "prepend" => PatchOp::Prepend,
-            "insert_at_heading" => PatchOp::InsertAtHeading,
-            "replace_section" => PatchOp::ReplaceSection,
-            other => {
-                return tool_error(format!(
-                    "unknown operation {other:?}; expected append, prepend, insert_at_heading, or replace_section"
-                ));
-            }
+        let path = match resolve_note_path(self.ctx.notes.vault(), &args.path) {
+            Ok(path) => path,
+            Err(e) => return tool_error(e),
         };
         let outcome = match self.ctx.writes.patch_note(
-            &args.path,
-            operation,
+            &path,
+            args.operation,
             &args.content,
             args.heading.as_deref(),
         ) {
@@ -449,14 +467,18 @@ impl ObsidianHandler {
 
     #[tool(
         name = "move_note",
-        description = "Move or rename a note (or any vault file), optionally updating wikilinks and markdown links across the vault that pointed at the old path."
+        description = "Move or rename a note (or any vault file). By default, wikilinks and markdown links across the vault that pointed at the old path are rewritten, like Obsidian's rename behavior. `from` may be a bare note name (\".md\" optional); `to` is the exact new path including the extension."
     )]
     async fn move_note(
         &self,
         Parameters(args): Parameters<MoveNoteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let from = match resolve_note_path(self.ctx.notes.vault(), &args.from) {
+            Ok(from) => from,
+            Err(e) => return tool_error(e),
+        };
         let outcome = match self.ctx.writes.move_note(
-            &args.from,
+            &from,
             &args.to,
             args.overwrite.unwrap_or(false),
             args.update_links.unwrap_or(true),
@@ -469,13 +491,17 @@ impl ObsidianHandler {
 
     #[tool(
         name = "delete_note",
-        description = "Delete a note by moving it to the vault's .trash folder. Recoverable; nothing is permanently removed."
+        description = "Delete a note by moving it to the vault's .trash folder — recoverable, nothing is permanently removed. The result reports the trash path the note landed at. Accepts a bare note name (\".md\" optional)."
     )]
     async fn delete_note(
         &self,
         Parameters(args): Parameters<DeleteNoteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let outcome = match self.ctx.writes.delete_note(&args.path) {
+        let path = match resolve_note_path(self.ctx.notes.vault(), &args.path) {
+            Ok(path) => path,
+            Err(e) => return tool_error(e),
+        };
+        let outcome = match self.ctx.writes.delete_note(&path) {
             Ok(outcome) => outcome,
             Err(e) => return tool_error(e),
         };
@@ -484,22 +510,13 @@ impl ObsidianHandler {
 
     #[tool(
         name = "daily_note",
-        description = "Work with daily notes: read the day's note, create it, or append to it (creating it when missing). The folder and filename format follow the vault's own daily-notes config."
+        description = "Read, create, or append to the daily note for a date (default today, UTC): \"get\" reads it (reporting the path even when it does not exist yet), \"create\" creates it (an existing note is left untouched), \"append\" appends, creating the note when missing. The folder and filename format follow the vault's own daily-notes config."
     )]
     async fn daily_note(
         &self,
         Parameters(args): Parameters<DailyNoteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let action = match args.action.as_deref().unwrap_or("get") {
-            "get" => DailyAction::Get,
-            "create" => DailyAction::Create,
-            "append" => DailyAction::Append,
-            other => {
-                return tool_error(format!(
-                    "unknown action {other:?}; expected get, create, or append"
-                ));
-            }
-        };
+        let action = args.action.unwrap_or(DailyAction::Get);
         let outcome =
             match self
                 .ctx
@@ -583,21 +600,32 @@ fn format_supervision(
     out
 }
 
-/// Resolves a tool-supplied path to a link-graph key: the exact path if it
-/// exists, otherwise the `.md`-appended variant. The link graph keys notes
-/// by their real vault paths, but agents habitually say `read_note`-style
-/// bare names ("Foo" for "Foo.md"), so the tools accept both.
-fn note_key(notes: &Notes, path: &str) -> Option<String> {
-    if notes.vault().read(path).is_ok() {
-        return Some(path.to_string());
-    }
-    if !path.ends_with(".md") {
-        let with_ext = format!("{path}.md");
-        if notes.vault().read(&with_ext).is_ok() {
-            return Some(with_ext);
+/// Resolves a tool-supplied note reference to the real vault path: the
+/// exact path if it exists, otherwise the `.md`-appended variant. Agents
+/// habitually pass bare names ("Foo" for "Foo.md"), so every tool that
+/// addresses an existing note accepts both — one contract across the
+/// tool set instead of per-tool quirks.
+///
+/// A missing note is reported with a discovery hint (list_notes /
+/// search_notes) so the caller can recover in one step; sandboxed-path
+/// errors (traversal, dot-folders) propagate unchanged — only a genuine
+/// miss gets the hint.
+fn resolve_note_path(vault: &Vault, path: &str) -> std::result::Result<String, VaultError> {
+    match vault.read(path) {
+        Ok(_) => Ok(path.to_string()),
+        Err(VaultError::NotFound(_)) => {
+            if !path.ends_with(".md") {
+                let with_ext = format!("{path}.md");
+                if vault.read(&with_ext).is_ok() {
+                    return Ok(with_ext);
+                }
+            }
+            Err(VaultError::NotFound(format!(
+                "{path}; use list_notes or search_notes to find the right path"
+            )))
         }
+        Err(e) => Err(e),
     }
-    None
 }
 
 fn text(content: impl Into<String>) -> Result<CallToolResult, ErrorData> {
@@ -806,12 +834,24 @@ mod tests {
     }
 
     #[test]
-    fn note_key_accepts_bare_name_and_full_path() {
+    fn resolve_note_path_accepts_bare_name_and_full_path() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("Foo.md"), "# Foo").expect("write");
-        let notes = Notes::open(Vault::open(dir.path()).expect("vault"));
-        assert_eq!(note_key(&notes, "Foo"), Some("Foo.md".to_string()));
-        assert_eq!(note_key(&notes, "Foo.md"), Some("Foo.md".to_string()));
-        assert_eq!(note_key(&notes, "Missing"), None);
+        let vault = Vault::open(dir.path()).expect("vault");
+        assert_eq!(
+            resolve_note_path(&vault, "Foo").expect("bare name"),
+            "Foo.md"
+        );
+        assert_eq!(
+            resolve_note_path(&vault, "Foo.md").expect("full path"),
+            "Foo.md"
+        );
+
+        // A miss carries the discovery hint; a sandbox violation keeps
+        // its real error instead of looking like a missing note.
+        let err = resolve_note_path(&vault, "Missing").expect_err("missing");
+        assert!(err.to_string().contains("list_notes"), "got: {err}");
+        let err = resolve_note_path(&vault, ".obsidian/app.json").expect_err("forbidden");
+        assert!(matches!(err, VaultError::Forbidden(_)), "got: {err}");
     }
 }

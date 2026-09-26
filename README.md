@@ -30,19 +30,32 @@ fast, and writes are pushed out by `ob` within seconds.
 
 | Tool | Kind | Description |
 |---|---|---|
-| `list_notes` | read | Recursive listing with size/mtime; optional path prefix filter |
-| `read_note` | read | Full note content incl. frontmatter; optional heading selection |
+| `list_notes` | read | List all files sorted by path, with size/mtime; optional prefix filter and limit |
+| `read_note` | read | Full note content incl. frontmatter; optional heading-section read |
 | `search_notes` | read | Full-text query (boolean/phrase) with optional path filter and limit |
 | `get_backlinks` | read | Notes linking to a given note |
 | `get_outlinks` | read | Links a given note points to |
 | `list_tags` | read | Tag inventory with counts |
-| `write_note` | write | Create or overwrite; frontmatter accepted separately |
-| `patch_note` | write | append / prepend / insert-at-heading / replace-section |
+| `write_note` | write | Create or overwrite a whole note; frontmatter accepted separately |
+| `patch_note` | write | append / prepend / insert-at-heading / replace-section (schema-enum `operation`) |
 | `move_note` | write | Rename/move; rewrites wikilinks and markdown links |
 | `delete_note` | write | Move to the vault's `.trash` (recoverable, never unlinked) |
-| `daily_note` | read+write | Read/today/create/append by `YYYY-MM-DD` date |
+| `daily_note` | read+write | get / create / append by `YYYY-MM-DD` date (schema-enum `action`) |
 | `sync_status` | sync | Run `ob sync-status`, report result |
 | `sync_now` | sync | Run a one-shot `ob sync`, report result |
+
+The tool set is designed for AI-agent callers:
+
+- **One path contract**: every tool that addresses an existing note accepts a
+  vault-relative path or a bare note name, with the `.md` extension optional.
+- **Self-correcting errors**: a missing note names the discovery tools
+  (`list_notes` / `search_notes`); a missing heading lists the note's actual
+  headings; an invalid enum argument names the valid variants.
+- **Constrained arguments**: `patch_note`'s `operation` and `daily_note`'s
+  `action` are JSON-schema enums, so clients pick from the valid values.
+- **Bounded output**: tool output is capped at 256 KiB; `list_notes` and
+  `search_notes` take a `limit`, and listings are path-sorted, so large vaults
+  can be paged with `prefix`.
 
 ## Requirements
 
@@ -117,6 +130,36 @@ beforehand to pre-populate.
 
 The image bundles the server binary and the `ob` CLI; the runtime stage is
 `node:22-alpine` because the supervised `ob` process needs Node 22+.
+
+The build stage always runs natively on the build machine's own
+architecture and cross-compiles with
+[cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) (a rust
+target plus zig as the cross C toolchain), so targeting another
+architecture stays fast: the ~400-crate release build is never emulated.
+
+### Cross-building for another architecture
+
+From an arm64 Mac, producing a linux/amd64 image for an x86_64 server:
+
+```sh
+# One-time setup for a Homebrew Docker CLI + colima daemon:
+brew install docker-buildx        # the buildx plugin is not bundled
+colima start
+docker run --privileged tonistiigi/binfmt --install amd64  # QEMU handlers
+
+# Build; --load tags the result into the local daemon.
+docker buildx build --platform linux/amd64 -t mcp-obsidian:amd64 --load .
+
+# Ship to the server without a registry...
+docker save mcp-obsidian:amd64 | gzip | ssh <server> 'gunzip | docker load'
+# ...or push to a registry and `docker pull` on the server instead.
+```
+
+Only the runtime stage's `npm install` executes under QEMU when
+cross-building (its base image is the target arch). `obsidian-headless`
+is small and pure JS, so that step is cheap. A plain `docker build` with
+no `--platform` still produces a native image for the build machine's
+own architecture.
 
 ```sh
 docker build -t mcp-obsidian .

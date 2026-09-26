@@ -151,19 +151,24 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
 
 | Tool | Kind | Description |
 |---|---|---|
-| `list_notes` | read | Recursive listing with size/mtime; optional path prefix filter |
-| `read_note` | read | Full note content incl. frontmatter; optional heading selection |
+| `list_notes` | read | List all files sorted by path, with size/mtime; optional prefix filter and limit |
+| `read_note` | read | Full note content incl. frontmatter; optional heading-section read |
 | `search_notes` | read | Tantivy query (boolean/phrase) with optional path filter and limit |
 | `get_backlinks` | read | Notes linking to a given note (via link graph) |
 | `get_outlinks` | read | Links a given note points to |
 | `list_tags` | read | Tag inventory with counts |
-| `write_note` | write | Create or overwrite; frontmatter accepted separately |
-| `patch_note` | write | append / prepend / insert-at-heading / replace-section |
+| `write_note` | write | Create or overwrite a whole note; frontmatter accepted separately |
+| `patch_note` | write | append / prepend / insert-at-heading / replace-section (schema-enum `operation`) |
 | `move_note` | write | Rename/move; rewrites wikilinks and markdown links |
 | `delete_note` | write | Move to vault `.trash` (recoverable) |
-| `daily_note` | read+write | Read/today/create/append by date |
+| `daily_note` | read+write | get / create / append by date (schema-enum `action`) |
 | `sync_status` | sync | Run `ob sync-status`, report result |
 | `sync_now` | sync | Run one-shot `ob sync`, report result |
+
+Agent-caller conventions: every tool addressing an existing note accepts a
+bare note name (`.md` optional); not-found errors name the discovery tools;
+heading misses list the note's actual headings; `list_notes`/`search_notes`
+page with `limit` under the 256 KiB output cap.
 
 ## Safety model
 

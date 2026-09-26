@@ -19,6 +19,10 @@ use std::fmt::Write as _;
 use std::ops::Range;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// The JsonSchema derive's generated code references `schemars::…` by path,
+// so the re-exported module must be in scope here (as server.rs does).
+use rmcp::schemars;
+
 use crate::markdown;
 use crate::notes::LinkTables;
 use crate::vault::{NoteEntry, Vault, VaultError};
@@ -34,8 +38,13 @@ pub const DAILY_NOTE_FORMAT: &str = "YYYY-MM-DD.md";
 /// notes folder in a vault without an Obsidian daily-notes config.
 const DAILY_DIR_CANDIDATES: [&str; 3] = ["Daily Notes", "Daily", "Journal"];
 
-/// How a [`Writes::patch_note`] call modifies the body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a [`Writes::patch_note`] call modifies the body. This is also the
+/// tool-schema enum: deriving `Deserialize`/`JsonSchema` here puts the
+/// variants in the JSON schema, so clients choose from a constrained
+/// list instead of spelling a string (a bad value still surfaces as a
+/// tool-level error naming the valid variants, via serde).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum PatchOp {
     /// Add content at the end of the body.
     Append,
@@ -48,8 +57,10 @@ pub enum PatchOp {
     ReplaceSection,
 }
 
-/// What a [`Writes::daily_note`] call does with the day's note.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a [`Writes::daily_note`] call does with the day's note. Also the
+/// tool-schema enum (see [`PatchOp`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum DailyAction {
     /// Read the day's note (or report its absence).
     Get,
@@ -170,15 +181,13 @@ impl Writes {
             PatchOp::Prepend => join_blocks(content, body),
             PatchOp::InsertAtHeading => {
                 let heading = heading.expect("checked above");
-                insert_at_heading(body, heading, content).ok_or_else(|| {
-                    VaultError::NotFound(format!("heading {heading:?} in note {path}"))
-                })?
+                insert_at_heading(body, heading, content)
+                    .ok_or_else(|| heading_not_found(path, body, heading))?
             }
             PatchOp::ReplaceSection => {
                 let heading = heading.expect("checked above");
-                replace_section(body, heading, content).ok_or_else(|| {
-                    VaultError::NotFound(format!("heading {heading:?} in note {path}"))
-                })?
+                replace_section(body, heading, content)
+                    .ok_or_else(|| heading_not_found(path, body, heading))?
             }
         };
         let new_raw = match frontmatter {
@@ -294,9 +303,28 @@ impl Writes {
             let body_offset = raw.len() - body.len();
             let source_dir = dir_of(&entry.path);
 
+            // Spans of BOTH link kinds, in raw coordinates. A wikilink can
+            // sit inside a markdown link's target (`[a](b[[old]]c)`) or
+            // straddle one (`[a](b[[old|a)b]]c)`), and splicing either
+            // would rewrite bytes belonging to the enclosing token —
+            // corrupting its target instead of updating a link. Any
+            // edit that overlaps a token of the other kind is skipped
+            // wholesale: a stale link inside a nonsensical target costs
+            // less than a mangled note.
+            let wikilinks = markdown::parse_wikilinks(&raw);
+            let md_links = markdown::parse_md_links(body);
+            let md_spans: Vec<Range<usize>> = md_links
+                .iter()
+                .map(|link| shift(&link.span, body_offset))
+                .collect();
+            let overlaps = |a: &Range<usize>, b: &Range<usize>| a.start < b.end && b.start < a.end;
+
             let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-            for link in markdown::parse_wikilinks(&raw) {
+            for link in &wikilinks {
                 if pre.resolve_wikilink(&link.target).as_deref() != Some(from) {
+                    continue;
+                }
+                if md_spans.iter().any(|span| overlaps(&link.span, span)) {
                     continue;
                 }
                 // "Did the written target carry the extension?" — this
@@ -318,8 +346,12 @@ impl Writes {
                     ),
                 ));
             }
-            for link in markdown::parse_md_links(body) {
+            for link in &md_links {
                 if link.external {
+                    continue;
+                }
+                let raw_span = shift(&link.span, body_offset);
+                if wikilinks.iter().any(|wiki| overlaps(&raw_span, &wiki.span)) {
                     continue;
                 }
                 let decoded = markdown::percent_decode(&link.target);
@@ -346,7 +378,7 @@ impl Writes {
                     continue;
                 }
                 edits.push((
-                    shift(&link.span, body_offset),
+                    raw_span,
                     format_md_link(
                         link.embed,
                         &link.text,
@@ -600,6 +632,16 @@ fn find_heading(body: &str, heading: &str) -> Option<markdown::Heading> {
     markdown::parse_headings(body)
         .into_iter()
         .find(|h| h.text.eq_ignore_ascii_case(heading.trim()))
+}
+
+/// The "heading not found" error. Heading matching is case-insensitive on
+/// the text alone, so listing the note's real headings lets a client
+/// retry with a valid one instead of guessing.
+fn heading_not_found(path: &str, body: &str, heading: &str) -> VaultError {
+    VaultError::NotFound(format!(
+        "heading {heading:?} not found in note {path}; available headings: {}",
+        markdown::heading_names(body)
+    ))
 }
 
 /// Writes `content` into `body` at byte offset `at` (always a heading
@@ -1472,5 +1514,625 @@ mod tests {
         assert_eq!(normalize_frontmatter("---\ntitle: X\n---"), "title: X");
         assert_eq!(normalize_frontmatter("title: X\n"), "title: X");
         assert_eq!(normalize_frontmatter("  \n"), "");
+    }
+}
+
+#[cfg(test)]
+mod properties {
+    //! Property-based tests (quickcheck) for the span-rewriting write
+    //! path: invariants that must hold for arbitrary note text, not just
+    //! hand-picked examples. The headline properties mirror this module's
+    //! safety claims: frontmatter survives a patch byte-identically, and
+    //! link rewriting never touches anything outside link tokens.
+
+    use super::*;
+    use crate::markdown;
+    use crate::notes::LinkTables;
+    use crate::vault::{Vault, VaultError};
+    use quickcheck::{Arbitrary, Gen};
+    use std::ops::Range;
+
+    /// Fragment pool for [`Soup`]: bracket shapes, fences, frontmatter,
+    /// BOMs, and link forms aimed at the fixture's notes. `(old.md)` is
+    /// its own fragment so the soup can place it directly after a
+    /// wikilink token — the overlap case that broke rewrites once.
+    const FRAGMENTS: &[&str] = &[
+        "[[",
+        "]]",
+        "![",
+        "[",
+        "]",
+        "(",
+        ")",
+        "|",
+        "#",
+        "#^",
+        "`",
+        "```",
+        "~~~",
+        "---",
+        " ",
+        "\n",
+        "\r\n",
+        "\u{feff}",
+        "/",
+        ".md",
+        "old",
+        "peer",
+        "noise",
+        "#tag",
+        "[[old]]",
+        "[[old.md]]",
+        "[[Old]]",
+        "[[old#H]]",
+        "[[old#^b]]",
+        "[[old|a]]",
+        "![[old]]",
+        "[x](old.md)",
+        "![x](old.md)",
+        "[x](old.md#s)",
+        "[[peer]]",
+        "[[noise]]",
+        "[x](peer.md)",
+        "(old.md)",
+        "[[a|b]](c)",
+    ];
+
+    /// A random concatenation of pool fragments and arbitrary Unicode.
+    #[derive(Clone, Debug)]
+    struct Soup(pub String);
+
+    impl Arbitrary for Soup {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let n = usize::arbitrary(g) % 48;
+            let mut s = String::new();
+            if bool::arbitrary(g) {
+                s.push('\u{feff}');
+            }
+            for _ in 0..n {
+                if bool::arbitrary(g) {
+                    s.push(char::arbitrary(g));
+                } else {
+                    s.push_str(g.choose(FRAGMENTS).expect("pool is non-empty"));
+                }
+            }
+            Soup(s)
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            // Halve by chars (never slicing through a multi-byte char);
+            // quickcheck walks this down to a minimal counterexample.
+            let half = self.0.chars().count() / 2;
+            let mut smaller = Vec::new();
+            if half > 0 {
+                smaller.push(Soup(self.0.chars().take(half).collect()));
+                smaller.push(Soup(self.0.chars().skip(half).collect()));
+            }
+            smaller.push(Soup(String::new()));
+            Box::new(smaller.into_iter())
+        }
+    }
+
+    /// A component string of characters that cannot collide with link
+    /// syntax, so format→parse roundtrips are required to be lossless.
+    fn component(g: &mut Gen, pool: &[char], min_len: usize) -> String {
+        let n = min_len + usize::arbitrary(g) % 6;
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push(*g.choose(pool).expect("pool is non-empty"));
+        }
+        s
+    }
+
+    const WIKI_CHARS: &[char] = &['a', 'B', '9', '-', '_', '/'];
+    const MD_TEXT_CHARS: &[char] = &['a', 'B', '9', ' ', '-', '_', '.', '~'];
+    const MD_TARGET_CHARS: &[char] = &['a', 'B', '9', '-', '_', '.', '~', '/', '%'];
+    const ANCHOR_CHARS: &[char] = &['a', 'B', '9', ' ', '-', '_', '.'];
+
+    #[derive(Clone, Debug)]
+    struct WikilinkParts {
+        embed: bool,
+        target: String,
+        heading: Option<String>,
+        block: Option<String>,
+        alias: Option<String>,
+    }
+
+    impl Arbitrary for WikilinkParts {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let optional = |g: &mut Gen| bool::arbitrary(g).then(|| component(g, WIKI_CHARS, 0));
+            Self {
+                embed: bool::arbitrary(g),
+                target: component(g, WIKI_CHARS, 1),
+                heading: optional(g),
+                block: optional(g),
+                alias: optional(g),
+            }
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            Box::new(std::iter::empty())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MdParts {
+        embed: bool,
+        text: String,
+        target: String,
+        anchor: Option<String>,
+    }
+
+    impl Arbitrary for MdParts {
+        fn arbitrary(g: &mut Gen) -> Self {
+            Self {
+                embed: bool::arbitrary(g),
+                text: component(g, MD_TEXT_CHARS, 0),
+                target: component(g, MD_TARGET_CHARS, 1),
+                anchor: bool::arbitrary(g).then(|| component(g, ANCHOR_CHARS, 0)),
+            }
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            Box::new(std::iter::empty())
+        }
+    }
+
+    fn fixture() -> (Writes, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        (
+            Writes::open(
+                Vault::open(dir.path()).expect("vault opens"),
+                DailyNoteSettings::default(),
+            ),
+            dir,
+        )
+    }
+
+    fn read(w: &Writes, path: &str) -> String {
+        String::from_utf8(w.vault.read(path).expect("read")).expect("utf-8")
+    }
+
+    /// Link-token spans in raw-note coordinates, mirroring `rewrite_links`
+    /// exactly: wikilinks parsed on the raw text, markdown links on the
+    /// body and shifted, overlaps resolved first-wins by span start — the
+    /// same rule `splice` applies. Any mismatch between this helper and
+    /// the rewriter would show up as a false failure in the properties
+    /// below, which is the point.
+    fn link_spans(raw: &str) -> Vec<Range<usize>> {
+        let (_, body) = markdown::split_frontmatter(raw);
+        let offset = raw.len() - body.len();
+        let mut spans: Vec<Range<usize>> = markdown::parse_wikilinks(raw)
+            .into_iter()
+            .map(|l| l.span)
+            .collect();
+        spans.extend(
+            markdown::parse_md_links(body)
+                .into_iter()
+                .map(|l| shift(&l.span, offset)),
+        );
+        spans.sort_by_key(|span| span.start);
+        let mut out: Vec<Range<usize>> = Vec::new();
+        for span in spans {
+            if out.last().is_none_or(|last| span.start >= last.end) {
+                out.push(span);
+            }
+        }
+        out
+    }
+
+    /// The note broken at link tokens; these pieces are the "unrelated
+    /// content" that link rewriting must never touch.
+    fn text_pieces(raw: &str) -> Vec<String> {
+        let mut pieces = Vec::new();
+        let mut cursor = 0;
+        for span in link_spans(raw) {
+            pieces.push(raw[cursor..span.start].to_string());
+            cursor = span.end;
+        }
+        pieces.push(raw[cursor..].to_string());
+        pieces
+    }
+
+    /// Link tokens (span + text) in the same order the rewriter sees them.
+    fn link_tokens(raw: &str) -> Vec<String> {
+        link_spans(raw)
+            .into_iter()
+            .map(|span| raw[span].to_string())
+            .collect()
+    }
+
+    /// Resolves one link token against a link table, mirroring
+    /// `rewrite_links`: wikilinks by (trimmed) target, markdown links
+    /// relative to the note's directory. External links never resolve —
+    /// and are therefore never rewritten — so they collapse to `None`
+    /// just like unresolved ones.
+    fn resolve_token(tables: &LinkTables, note_path: &str, token: &str) -> Option<String> {
+        if token.starts_with("[[") || token.starts_with("![[") {
+            let link = markdown::parse_wikilinks(token).first()?.clone();
+            return tables.resolve_wikilink(&link.target);
+        }
+        let link = markdown::parse_md_links(token).first()?.clone();
+        if link.external {
+            return None;
+        }
+        tables.resolve_md_link(&dir_of(note_path), &markdown::percent_decode(&link.target))
+    }
+
+    /// Destinations the property moves `old.md` to: root, a subfolder, and
+    /// a name with a space (percent-encoding and relative-path cases).
+    const DESTINATIONS: [&str; 3] = ["new.md", "sub/new.md", "New Name.md"];
+
+    /// Every from-link shape the rewriter supports, seeded into the
+    /// linking note so each run rewrites something; the soup supplies the
+    /// pathological surroundings.
+    const OLD_LINK_FORMS: &[&str] = &[
+        "[[old]]",
+        "[[old.md]]",
+        "[[Old]]",
+        "[[old#H]]",
+        "[[old#^b]]",
+        "[[old|alias]]",
+        "![[old]]",
+        "[x](old.md)",
+        "![x](old.md)",
+        "[x](old.md#sec)",
+    ];
+
+    /// An invalid-UTF-8 note that links to the moved note: the rewriter
+    /// must skip it, never "repair" it into replacement characters.
+    const BINARY_BYTES: &[u8] = b"---\ntitle: ol\xffd \xfe\n---\n[[old]] and [[old.md]]\n";
+
+    quickcheck::quickcheck! {
+        /// Rebuilding a wikilink from its parsed parts must reproduce it
+        /// field for field — `move_note` relies on this to preserve
+        /// embeds, headings, block refs, and aliases across rewrites.
+        fn wikilink_format_parse_roundtrip(parts: WikilinkParts) -> bool {
+            let token = format_wikilink(
+                parts.embed,
+                &parts.target,
+                parts.heading.as_deref(),
+                parts.block.as_deref(),
+                parts.alias.as_deref(),
+            );
+            let links = markdown::parse_wikilinks(&token);
+            let Some(link) = links.first() else {
+                return false;
+            };
+            link.embed == parts.embed
+                && link.target == parts.target
+                && link.heading == parts.heading
+                && link.block == parts.block
+                && link.alias == parts.alias
+        }
+
+        /// Same for markdown links, plus the percent roundtrip: an encoded
+        /// target decodes back to the path it was built from.
+        fn md_link_format_parse_roundtrip(parts: MdParts) -> bool {
+            let token = format_md_link(
+                parts.embed,
+                &parts.text,
+                &parts.target,
+                parts.anchor.as_deref(),
+            );
+            let links = markdown::parse_md_links(&token);
+            let Some(link) = links.first() else {
+                return false;
+            };
+            link.embed == parts.embed
+                && link.text == parts.text
+                && link.target == parts.target
+                && link.anchor == parts.anchor
+                && !link.external
+        }
+
+        /// percent_encode_path is byte-exact, so percent_decode inverts it
+        /// for any input (this is what carries a path through a rewrite).
+        fn percent_encoding_roundtrips(text: String) -> bool {
+            markdown::percent_decode(&percent_encode_path(&text)) == text
+        }
+
+        /// patch_note preserves the frontmatter block byte-identically and
+        /// transforms the body exactly as join_blocks prescribes — for any
+        /// existing note content, however malformed.
+        fn patch_preserves_frontmatter_byte_identically(raw: String) -> bool {
+            let (w, _d) = fixture();
+            w.vault.write("n.md", raw.as_bytes()).expect("seed");
+            w.patch_note("n.md", PatchOp::Append, "prop\n", None)
+                .expect("append");
+            let after = read(&w, "n.md");
+            let (fm_old, body_old) = markdown::split_frontmatter(&raw);
+            let (fm_new, body_new) = markdown::split_frontmatter(&after);
+            if fm_old != fm_new || body_new != join_blocks(body_old, "prop\n") {
+                return false;
+            }
+
+            w.patch_note("n.md", PatchOp::Prepend, "prop2\n", None)
+                .expect("prepend");
+            let after2 = read(&w, "n.md");
+            let (fm_2, body_2) = markdown::split_frontmatter(&after2);
+            fm_2 == fm_old && body_2 == join_blocks("prop2\n", body_new)
+        }
+
+        /// A non-UTF-8 note is refused (never lossily "repaired"), and its
+        /// bytes on disk are untouched; valid UTF-8 always patches.
+        fn patch_never_touches_non_utf8_notes(bytes: Vec<u8>) -> bool {
+            let (w, _d) = fixture();
+            w.vault.write("n.md", &bytes).expect("seed");
+            let result = w.patch_note("n.md", PatchOp::Append, "x\n", None);
+            let stored = w.vault.read("n.md").expect("read back");
+            match std::str::from_utf8(&bytes) {
+                Err(_) => {
+                    matches!(result, Err(VaultError::NotUtf8(_))) && stored == bytes
+                }
+                Ok(_) => result.is_ok(),
+            }
+        }
+
+        /// splice replaces exactly the selected spans and nothing else,
+        /// regardless of the order edits arrive in (it must sort them
+        /// itself; rewrite_links happens to push wikilinks first).
+        fn splice_touches_only_selected_spans(raw: Soup, repl: String, picks: Vec<bool>) -> bool {
+            let Soup(raw) = raw;
+            let selected: Vec<(Range<usize>, String)> = link_spans(&raw)
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !picks.is_empty() && picks[i % picks.len()])
+                .map(|(_, span)| (span, repl.clone()))
+                .collect();
+            let mut shuffled = selected.clone();
+            shuffled.reverse();
+            let got = splice(&raw, shuffled);
+            let mut expect = String::new();
+            let mut cursor = 0;
+            for (span, replacement) in selected {
+                expect.push_str(&raw[cursor..span.start]);
+                expect.push_str(&replacement);
+                cursor = span.end;
+            }
+            expect.push_str(&raw[cursor..]);
+            got == expect
+        }
+    }
+
+    /// One deterministic move-rewrite case; `Err` carries a description of
+    /// the broken invariant (used by the quickcheck property and by the
+    /// regression tests, which need the details on failure).
+    fn move_case(
+        dest: usize,
+        with_fm: bool,
+        other: &str,
+        old: &str,
+        noise: &str,
+        peer: &str,
+    ) -> std::result::Result<(), String> {
+        const FROM: &str = "old.md";
+        let to = DESTINATIONS[dest % DESTINATIONS.len()];
+        let (w, _d) = fixture();
+
+        let fm = if with_fm {
+            "---\nlinked: \"[[old]]\"\ntags: [[old.md]]\n---\n"
+        } else {
+            ""
+        };
+        let other_raw = format!("{fm}{}\n{}", OLD_LINK_FORMS.join("\n"), other);
+        let old_raw = format!("[[old]] [[peer]] [x](old.md) [x](noise.md) [[noise]]\n{old}");
+        let peer_raw = format!("[[old]] [x](../old.md)\n{peer}");
+        let noise_raw = noise.to_string();
+
+        for (path, bytes) in [
+            (FROM, old_raw.clone().into_bytes()),
+            ("other.md", other_raw.clone().into_bytes()),
+            ("sub/peer.md", peer_raw.clone().into_bytes()),
+            ("noise.md", noise_raw.clone().into_bytes()),
+            ("binary.md", BINARY_BYTES.to_vec()),
+        ] {
+            w.vault.write(path, &bytes).expect("seed");
+        }
+
+        let pre = LinkTables::build([
+            FROM.to_string(),
+            "other.md".into(),
+            "sub/peer.md".into(),
+            "noise.md".into(),
+            "binary.md".into(),
+        ]);
+        let post = LinkTables::build([
+            to.to_string(),
+            "other.md".into(),
+            "sub/peer.md".into(),
+            "noise.md".into(),
+            "binary.md".into(),
+        ]);
+
+        w.move_note(FROM, to, false, true)
+            .map_err(|e| format!("move failed: {e:?}"))?;
+
+        if w.vault.read("binary.md").expect("binary") != BINARY_BYTES {
+            return Err("non-UTF-8 note was rewritten".into());
+        }
+
+        for (path_old, path_new, before) in [
+            (FROM, to, old_raw),
+            ("other.md", "other.md", other_raw),
+            ("sub/peer.md", "sub/peer.md", peer_raw),
+            ("noise.md", "noise.md", noise_raw),
+        ] {
+            let after = read(&w, path_new);
+            let moved = path_old == FROM;
+
+            if markdown::split_frontmatter(&before).0.is_some()
+                != markdown::split_frontmatter(&after).0.is_some()
+            {
+                return Err(format!("frontmatter presence changed in {path_old}"));
+            }
+            if text_pieces(&before) != text_pieces(&after) {
+                return Err(format!(
+                    "text outside link tokens changed in {path_old}\n\
+                     before: {before:?}\n\
+                     after:  {after:?}"
+                ));
+            }
+
+            let old_tokens = link_tokens(&before);
+            let new_tokens = link_tokens(&after);
+            if old_tokens.len() != new_tokens.len() {
+                return Err(format!(
+                    "token count changed in {path_old}: {} -> {}\n\
+                     before: {before:?}\n\
+                     after:  {after:?}",
+                    old_tokens.len(),
+                    new_tokens.len()
+                ));
+            }
+            for (old_tok, new_tok) in old_tokens.iter().zip(&new_tokens) {
+                // An untouched token needs no further checks: its bytes
+                // are unchanged, so any shift in what it *resolves to*
+                // comes from the move itself (a relative link in the
+                // moved note reads against a new directory), not from
+                // rewriting.
+                if old_tok == new_tok {
+                    continue;
+                }
+                // The token text changed: that is only legitimate for a
+                // link the rewriter was supposed to touch.
+                let resolved_old = resolve_token(&pre, path_old, old_tok);
+                let resolved_new = resolve_token(&post, path_new, new_tok);
+                let is_wikilink = new_tok.starts_with("[[") || new_tok.starts_with("![[");
+                if resolved_old.as_deref() == Some(FROM) {
+                    // A link to the moved note must still reach it.
+                    if resolved_new.as_deref() != Some(to) {
+                        return Err(format!(
+                            "link to the moved note no longer resolves in {path_old}:\n\
+                             {old_tok:?} -> {new_tok:?}"
+                        ));
+                    }
+                } else if moved && !is_wikilink {
+                    // The moved note's markdown links are recomputed
+                    // relative to its new directory; their target file
+                    // must not change.
+                    if resolved_new != resolved_old {
+                        return Err(format!(
+                            "recomputed markdown link changed target in {path_old}:\n\
+                             {old_tok:?} -> {new_tok:?}"
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "unrelated link was rewritten in {path_old}:\n\
+                         {old_tok:?} -> {new_tok:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A tiny xorshift PRNG: the move property needs random note text but
+    /// must stay bounded — quickcheck's shrink search runs the property
+    /// an unbounded number of times per failing case, and each case here
+    /// seeds a real tempdir vault (fsync per write). A fixed seed makes
+    /// failures reproducible without any shrink loop at all.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*: cheap, decent mixing, no dependencies.
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+            &items[self.below(items.len())]
+        }
+
+        fn flag(&mut self) -> bool {
+            self.next() & 1 == 0
+        }
+    }
+
+    /// Random adversarial note text from the same fragment pool as
+    /// [`Soup`], driven by [`Rng`] instead of quickcheck's `Gen`.
+    fn rng_soup(rng: &mut Rng) -> String {
+        let mut s = String::new();
+        if rng.flag() {
+            s.push('\u{feff}');
+        }
+        for _ in 0..rng.below(48) {
+            // Arbitrary Unicode interleaved with the metacharacter pool.
+            if rng.flag() {
+                s.push(*rng.pick(&['[', ']', '(', ')', '|', '#', '^', 'a', 'Z', '9', ' ', 'é']));
+            } else {
+                s.push_str(rng.pick(FRAGMENTS));
+            }
+        }
+        s
+    }
+
+    /// The headline property: moving a note with link updating changes
+    /// *only* link tokens, for arbitrary note contents. For every
+    /// affected note:
+    /// - the text outside link tokens is byte-identical,
+    /// - frontmatter still parses as frontmatter (its links are
+    ///   rewritten by design, so structure, not bytes, is checked),
+    /// - the token sequence is preserved, and
+    /// - any token whose text changed is one the rewriter was supposed
+    ///   to touch: a link to the moved note (which must still reach it
+    ///   at its new path) or a markdown link inside the moved note
+    ///   (recomputed relative to its new directory, same target file).
+    ///
+    /// Untouched tokens may *resolve* differently after the move — a
+    /// relative link in a relocated note reads against a new directory —
+    /// but their bytes never change.
+    /// The invalid-UTF-8 note is skipped, never "repaired".
+    ///
+    /// A fixed-seed loop rather than `quickcheck!`: each case pays real
+    /// fsync cost (atomic writes), so an unbounded shrink search on a
+    /// failing case would outrun the test timeout. The seed is fixed,
+    /// making any failure reproducible from the printed case.
+    #[test]
+    fn move_rewriting_confines_itself_to_link_tokens() {
+        let mut rng = Rng(0x00C0_FFEE_D15E_A5E5);
+        for case in 0..128 {
+            let dest = rng.below(DESTINATIONS.len());
+            let with_fm = rng.flag();
+            let other = rng_soup(&mut rng);
+            let old = rng_soup(&mut rng);
+            let noise = rng_soup(&mut rng);
+            let peer = rng_soup(&mut rng);
+            if let Err(reason) = move_case(dest, with_fm, &other, &old, &noise, &peer) {
+                panic!(
+                    "case {case} (dest={dest}, with_fm={with_fm},\n\
+                     other={other:?},\nold={old:?},\nnoise={noise:?},\npeer={peer:?}):\n\
+                     {reason}"
+                );
+            }
+        }
+    }
+
+    /// Found by the `move_rewriting_confines_itself_to_link_tokens`
+    /// property: a wikilink inside a markdown link's target (or
+    /// straddling one) must never be rewritten — splicing it would
+    /// corrupt the enclosing token's target bytes. Such constructs stay
+    /// byte-identical through a move.
+    #[test]
+    fn move_note_leaves_overlapping_link_tokens_untouched() {
+        for content in ["[a](b[[old]]c)\n", "[a](b[[old|a)b]]c)\n"] {
+            let (w, _d) = fixture();
+            w.vault.write("old.md", b"x\n").expect("seed");
+            w.vault.write("other.md", content.as_bytes()).expect("seed");
+            w.move_note("old.md", "New Name.md", false, true)
+                .expect("move");
+            let after = String::from_utf8(w.vault.read("other.md").expect("read")).expect("utf-8");
+            assert_eq!(after, content, "overlapping link was rewritten");
+        }
     }
 }

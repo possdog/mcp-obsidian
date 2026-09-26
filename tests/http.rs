@@ -380,6 +380,81 @@ async fn client_round_trip_over_streamable_http() {
     server.stop().await;
 }
 
+/// Agent recovery paths: every tool that addresses a note accepts a bare
+/// name, a miss names the discovery tools, a bad heading lists the real
+/// ones, and list_notes can page with limit.
+#[tokio::test]
+async fn failure_paths_are_actionable() {
+    let server = TestServer::start().await;
+    let client = connect(&server.addr, TOKEN)
+        .await
+        .expect("client initialize");
+
+    // Bare names (no .md) resolve for every tool that addresses a note.
+    for (tool, args) in [
+        ("read_note", serde_json::json!({ "path": "hello" })),
+        ("get_backlinks", serde_json::json!({ "path": "hello" })),
+        ("get_outlinks", serde_json::json!({ "path": "hello" })),
+        ("delete_note", serde_json::json!({ "path": "world" })),
+    ] {
+        let result = client
+            .call_tool(call(tool, args))
+            .await
+            .unwrap_or_else(|_| panic!("{tool} call"));
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "{tool} must accept a bare name"
+        );
+    }
+    // delete_note took world.md to the trash; hello.md survives.
+    let result = client
+        .call_tool(call("read_note", serde_json::json!({ "path": "hello" })))
+        .await
+        .expect("read_note call");
+    assert_ne!(result.is_error, Some(true));
+
+    // A missing note points at the discovery tools.
+    let result = client
+        .call_tool(call("read_note", serde_json::json!({ "path": "nope" })))
+        .await
+        .expect("read_note call");
+    assert_eq!(result.is_error, Some(true));
+    let text = result_text(&result);
+    assert!(text.contains("not found"), "got: {text}");
+    assert!(text.contains("list_notes"), "got: {text}");
+    assert!(text.contains("search_notes"), "got: {text}");
+
+    // A missing heading lists the note's real headings (case-insensitive
+    // matching makes the names enough to retry).
+    let result = client
+        .call_tool(call(
+            "read_note",
+            serde_json::json!({ "path": "hello.md", "heading": "zzz" }),
+        ))
+        .await
+        .expect("read_note call");
+    assert_eq!(result.is_error, Some(true));
+    let text = result_text(&result);
+    assert!(
+        text.contains("available headings: Hello, Notes"),
+        "got: {text}"
+    );
+
+    // list_notes pages by limit; results stay sorted by path.
+    let result = client
+        .call_tool(call("list_notes", serde_json::json!({ "limit": 1 })))
+        .await
+        .expect("list_notes call");
+    assert_ne!(result.is_error, Some(true));
+    let text = result_text(&result);
+    assert!(text.contains("hello.md"), "got: {text}");
+    assert_eq!(text.lines().count(), 1, "one line only, got: {text}");
+
+    client.cancel().await.expect("client cancel");
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn write_tools_round_trip() {
     let server = TestServer::start().await;
@@ -909,8 +984,8 @@ async fn auth_middleware_rejects_probes() {
 }
 
 /// Malformed and hostile tool calls: unknown tools, wrong-typed arguments,
-/// unknown enum values, and unknown operations are reported as failures
-/// without wedging the session; benign extra arguments are tolerated.
+/// and unknown enum values are reported as failures without wedging the
+/// session; benign extra arguments are tolerated.
 #[tokio::test]
 async fn malformed_tool_calls_are_reported_not_fatal() {
     let server = TestServer::start().await;
@@ -942,7 +1017,9 @@ async fn malformed_tool_calls_are_reported_not_fatal() {
         result_text(&result)
     );
 
-    // Unknown enum values surface as actionable tool errors.
+    // Unknown enum values surface as actionable tool errors: the schema
+    // enumerates the variants, and a bad value fails deserialization with
+    // the valid ones named in the message.
     let result = client
         .call_tool(call(
             "patch_note",
@@ -952,7 +1029,12 @@ async fn malformed_tool_calls_are_reported_not_fatal() {
         .expect("patch_note call");
     assert_eq!(result.is_error, Some(true));
     assert!(
-        result_text(&result).contains("unknown operation"),
+        result_text(&result).contains("unknown variant"),
+        "got: {}",
+        result_text(&result)
+    );
+    assert!(
+        result_text(&result).contains("replace_section"),
         "got: {}",
         result_text(&result)
     );
@@ -965,7 +1047,22 @@ async fn malformed_tool_calls_are_reported_not_fatal() {
         .expect("daily_note call");
     assert_eq!(result.is_error, Some(true));
     assert!(
-        result_text(&result).contains("unknown action"),
+        result_text(&result).contains("unknown variant"),
+        "got: {}",
+        result_text(&result)
+    );
+
+    // A missing required argument is a tool-level error naming the field.
+    let result = client
+        .call_tool(call(
+            "patch_note",
+            serde_json::json!({ "path": "hello.md", "content": "x" }),
+        ))
+        .await
+        .expect("patch_note call");
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("operation"),
         "got: {}",
         result_text(&result)
     );

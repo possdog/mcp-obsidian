@@ -17,9 +17,10 @@ All verified from the repo root. Tests are fully self-contained — tempdir
 vault fixtures and a stub `ob` shell script; no network, no real Obsidian.
 
 ```sh
-cargo test                      # unit + integration; ~5s
+cargo test                      # unit + integration; ~10s (property tests dominate)
 cargo test --test http <name>   # one end-to-end HTTP test
 cargo test vault::              # unit tests in one module (#[cfg(test)] at the file bottom)
+cargo test properties::         # quickcheck property tests (markdown + writes)
 cargo clippy --all-targets      # must be clean
 cargo fmt                       # run before wrapping up
 ```

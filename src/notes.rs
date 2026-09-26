@@ -101,8 +101,15 @@ impl Notes {
         let raw = String::from_utf8_lossy(&raw_bytes).into_owned();
         let (frontmatter, body) = markdown::split_frontmatter(&raw);
         let body = match heading {
-            Some(h) => markdown::extract_section(body, h)
-                .ok_or_else(|| VaultError::NotFound(format!("heading {h:?} in note {path}")))?,
+            Some(h) => markdown::extract_section(body, h).ok_or_else(|| {
+                // List the real headings: matching is case-insensitive on
+                // the text alone, so the message is enough for a client
+                // to retry with a valid heading in one step.
+                VaultError::NotFound(format!(
+                    "heading {h:?} not found in note {path}; available headings: {}",
+                    markdown::heading_names(body)
+                ))
+            })?,
             None => body.to_string(),
         };
         Ok(ReadResult {
