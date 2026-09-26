@@ -1,0 +1,17 @@
+[package]
+name = "mcp-obsidian"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive", "env"] }
+notify = "8.2.0"
+rmcp = { version = "3.4.1", features = ["client", "server", "transport-streamable-http-server"] }
+serde = { version = "1.0.229", features = ["derive"] }
+tantivy = "0.26.2"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+walkdir = "2.5.0"
