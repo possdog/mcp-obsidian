@@ -5,7 +5,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use mcp_obsidian::search::{SearchIndex, WatcherHandle};
 use mcp_obsidian::server::{self, ServerContext};
 use mcp_obsidian::sync::{SupervisorOptions, SyncSupervisor};
 use mcp_obsidian::vault::Vault;
@@ -21,9 +23,11 @@ struct TestServer {
     addr: SocketAddr,
     cancellation: CancellationToken,
     supervisor: Arc<SyncSupervisor>,
+    watcher: WatcherHandle,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
-    // Keeps the fixture alive for the server's lifetime.
+    // Keep the fixtures alive for the server's lifetime.
     _vault: tempfile::TempDir,
+    _index: tempfile::TempDir,
 }
 
 impl TestServer {
@@ -38,13 +42,14 @@ impl TestServer {
             .expect("write world");
 
         // Stub ob: one-shot commands answer and exit; `sync --continuous`
-        // (what the supervisor runs) stays alive. Dispatching on the
-        // subcommand keeps the sync_status tool from waiting out its
-        // timeout against a script that never exits.
+        // (what the supervisor runs) stays alive. The daemon and the
+        // one-shot `sync` share the `sync` subcommand, so dispatch also
+        // checks $2: without that, the "daemon: running" assertion races
+        // the supervisor's backoff loop.
         let ob = vault.path().join("ob-stub");
         std::fs::write(
             &ob,
-            "#!/bin/sh\ncase \"$1\" in\n  sync-status) echo 'status: synced (stub)'; exit 0;;\n  sync) echo 'synced (stub)'; exit 0;;\nesac\nexec sleep 300\n",
+            "#!/bin/sh\ncase \"$1\" in\n  sync-status) echo 'status: synced (stub)'; exit 0;;\n  sync)\n    case \"$2\" in\n      --continuous) ;;\n      *) echo 'synced (stub)'; exit 0;;\n    esac\n    ;;\nesac\nexec sleep 300\n",
         )
         .expect("write stub");
         set_executable(&ob);
@@ -62,8 +67,26 @@ impl TestServer {
             },
         ));
 
+        // Search index: independent tempdir (never inside the vault, which
+        // would both trip the watcher and get synced), rebuilt at startup
+        // exactly like the real server does, then kept fresh by its own
+        // watcher. The debounce is short so the live-re-index test below
+        // does not need to wait out the production window.
+        let index_dir = tempfile::tempdir().expect("index tempdir");
+        let search = Arc::new(SearchIndex::open(index_dir.path()).expect("index opens"));
+        search
+            .build_all(&Vault::open(&vault_root).expect("vault"))
+            .expect("index builds");
+        let watcher = search
+            .spawn_watcher(
+                &Vault::open(&vault_root).expect("vault"),
+                Duration::from_millis(100),
+            )
+            .expect("watcher starts");
+
         let ctx = ServerContext::new(
             Vault::open(&vault_root).expect("vault"),
+            search,
             ob_bin.as_str(),
             supervisor.clone(),
         );
@@ -85,8 +108,10 @@ impl TestServer {
             addr,
             cancellation,
             supervisor,
+            watcher,
             task,
             _vault: vault,
+            _index: index_dir,
         }
     }
 
@@ -97,6 +122,7 @@ impl TestServer {
             .expect("server task")
             .expect("server served cleanly");
         self.supervisor.stop().await;
+        self.watcher.stop();
     }
 }
 
@@ -162,6 +188,7 @@ async fn client_round_trip_over_streamable_http() {
     for expected in [
         "list_notes",
         "read_note",
+        "search_notes",
         "get_backlinks",
         "get_outlinks",
         "list_tags",
@@ -223,6 +250,76 @@ async fn client_round_trip_over_streamable_http() {
     let text = result_text(&result);
     assert!(text.contains("#greeting"), "got: {text}");
     assert!(text.contains("#sample"), "got: {text}");
+
+    // Full-text search: the frontmatter tag "greeting" is indexed.
+    let result = client
+        .call_tool(call(
+            "search_notes",
+            serde_json::json!({ "query": "greeting" }),
+        ))
+        .await
+        .expect("search_notes call");
+    assert_ne!(result.is_error, Some(true));
+    let text = result_text(&result);
+    assert!(text.contains("hello.md"), "got: {text}");
+    assert!(text.contains("Hello"), "title missing; got: {text}");
+
+    // Prefix filter with no match.
+    let result = client
+        .call_tool(call(
+            "search_notes",
+            serde_json::json!({ "query": "*", "prefix": "no/such/dir" }),
+        ))
+        .await
+        .expect("search_notes call");
+    assert!(
+        result_text(&result).contains("No notes match"),
+        "got: {}",
+        result_text(&result)
+    );
+
+    // Live re-indexing: a note written after startup is found once the
+    // watcher's debounce window has passed.
+    std::fs::write(
+        server._vault.path().join("searchable.md"),
+        "# Searchable\n\nA unique xylophone passage.\n",
+    )
+    .expect("write searchable");
+    let found = {
+        let client = &client;
+        let mut found = false;
+        for _ in 0..50 {
+            let result = client
+                .call_tool(call(
+                    "search_notes",
+                    serde_json::json!({ "query": "xylophone" }),
+                ))
+                .await
+                .expect("search_notes call");
+            if result_text(&result).contains("searchable.md") {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        found
+    };
+    assert!(found, "watcher should index the new note within 5s");
+
+    // Invalid query syntax is a tool-level error the model can act on.
+    let result = client
+        .call_tool(call(
+            "search_notes",
+            serde_json::json!({ "query": "nosuchfield:x" }),
+        ))
+        .await
+        .expect("search_notes call");
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("invalid query"),
+        "got: {}",
+        result_text(&result)
+    );
 
     let result = client
         .call_tool(call("sync_status", serde_json::json!({})))

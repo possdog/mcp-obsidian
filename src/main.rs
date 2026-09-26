@@ -1,5 +1,6 @@
 use clap::Parser;
 use mcp_obsidian::config::Config;
+use mcp_obsidian::search::{SearchIndex, WATCH_DEBOUNCE};
 use mcp_obsidian::server::{self, ServerContext};
 use mcp_obsidian::sync::SyncSupervisor;
 use mcp_obsidian::vault::Vault;
@@ -31,6 +32,32 @@ async fn main() {
         }
     };
 
+    // The search index is fully rebuilt at startup: while the server was
+    // down, `ob` may have pulled remote changes that no watcher observed.
+    let search = match SearchIndex::open(&index_dir) {
+        Ok(index) => index,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot open search index");
+            std::process::exit(1);
+        }
+    };
+    match search.build_all(&vault) {
+        Ok(count) => tracing::info!(notes = count, "search index built"),
+        Err(e) => {
+            tracing::error!(error = %e, "cannot build search index");
+            std::process::exit(1);
+        }
+    }
+    let search = std::sync::Arc::new(search);
+    // From here on, live filesystem events keep the index fresh.
+    let watcher = match search.clone().spawn_watcher(&vault, WATCH_DEBOUNCE) {
+        Ok(watcher) => watcher,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot start search watcher");
+            std::process::exit(1);
+        }
+    };
+
     // The HTTP listener is remotely reachable, so it never starts without a
     // token; there is no "open mode" to accidentally deploy.
     let auth_token = match &config.auth_token {
@@ -45,7 +72,7 @@ async fn main() {
     // `ob sync-setup` happen out-of-band on the host before startup.
     let root = vault.root().to_path_buf();
     let supervisor = std::sync::Arc::new(SyncSupervisor::start(&config.ob_bin, &root));
-    let ctx = ServerContext::new(vault, config.ob_bin.as_str(), supervisor.clone());
+    let ctx = ServerContext::new(vault, search, config.ob_bin.as_str(), supervisor.clone());
 
     let cancellation = CancellationToken::new();
     let router = server::router(
@@ -88,6 +115,8 @@ async fn main() {
     tracing::info!("http server stopped");
     let final_state = supervisor.stop().await;
     tracing::info!(restarts = final_state.restarts, "sync supervisor stopped");
+    watcher.stop();
+    tracing::info!("search watcher stopped");
 }
 
 /// Resolves on the first shutdown signal: SIGINT (Ctrl-C) or SIGTERM

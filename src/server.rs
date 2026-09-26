@@ -31,6 +31,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::notes::Notes;
+use crate::search::SearchIndex;
 use crate::sync::{self, SyncSupervisor};
 use crate::vault::Vault;
 
@@ -44,14 +45,21 @@ pub const MAX_TOOL_OUTPUT: usize = 256 * 1024;
 #[derive(Clone)]
 pub struct ServerContext {
     notes: Arc<Notes>,
+    search: Arc<SearchIndex>,
     ob_bin: Arc<str>,
     supervisor: Arc<SyncSupervisor>,
 }
 
 impl ServerContext {
-    pub fn new(vault: Vault, ob_bin: impl Into<Arc<str>>, supervisor: Arc<SyncSupervisor>) -> Self {
+    pub fn new(
+        vault: Vault,
+        search: Arc<SearchIndex>,
+        ob_bin: impl Into<Arc<str>>,
+        supervisor: Arc<SyncSupervisor>,
+    ) -> Self {
         Self {
             notes: Arc::new(Notes::open(vault)),
+            search,
             ob_bin: ob_bin.into(),
             supervisor,
         }
@@ -132,6 +140,20 @@ struct ReadNoteArgs {
 struct LinkQueryArgs {
     /// Vault-relative path or bare note name (".md" is optional).
     path: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(default)]
+struct SearchNotesArgs {
+    /// Search query. Bare terms are AND-combined; "quoted phrases",
+    /// field:term (title:, aliases:, tags:, body:, frontmatter_raw:),
+    /// -excluded, and * (all notes) are also supported.
+    query: String,
+    /// Only return notes whose vault-relative path starts with this
+    /// prefix (case-insensitive), e.g. "journal/2026".
+    prefix: Option<String>,
+    /// Maximum number of results to return (1-100, default 20).
+    limit: Option<usize>,
 }
 
 #[tool_router(server_handler)]
@@ -259,6 +281,43 @@ impl ObsidianHandler {
         let mut out = String::new();
         for tag in tags {
             let _ = writeln!(out, "- #{} ({} notes)", tag.tag, tag.notes);
+        }
+        text(out)
+    }
+
+    #[tool(
+        name = "search_notes",
+        description = "Full-text search across the vault (note bodies, titles, aliases, tags, and frontmatter). Returns matching paths ranked by relevance with snippets."
+    )]
+    async fn search_notes(
+        &self,
+        Parameters(args): Parameters<SearchNotesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Clamp rather than reject: absurd limits are a modeling artifact,
+        // not a user decision worth a round trip.
+        let limit = args.limit.unwrap_or(20).clamp(1, 100);
+        let hits = match self
+            .ctx
+            .search
+            .search(&args.query, args.prefix.as_deref(), limit)
+        {
+            Ok(hits) => hits,
+            Err(e) => return tool_error(e),
+        };
+        if hits.is_empty() {
+            return text("No notes match the query.");
+        }
+        let mut out = String::new();
+        for (i, hit) in hits.iter().enumerate() {
+            let _ = writeln!(out, "{}. {} (score {:.2})", i + 1, hit.path, hit.score);
+            if !hit.title.is_empty() {
+                let _ = writeln!(out, "   {}", hit.title);
+            }
+            if let Some(snippet) = &hit.snippet
+                && !snippet.is_empty()
+            {
+                let _ = writeln!(out, "   {}", snippet);
+            }
         }
         text(out)
     }

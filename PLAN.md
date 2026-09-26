@@ -75,15 +75,26 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
 - **search** — tantivy index stored in a configurable directory.
   Schema (fixed fields):
   - `path` (fast + stored) — vault-relative, unique doc key
-  - `title` (text) — first H1 or filename
+  - `path_lower` (string) — lowercased copy for case-insensitive prefix
+    filtering (tantivy's regex queries run on fst automata that support
+    neither anchors nor `(?i)`, so case folding happens at index time)
+  - `title` (text, stored) — first H1 or filename stem
   - `aliases` (text) — from frontmatter
   - `tags` (text, indexed as individual terms) — frontmatter + body
   - `frontmatter_raw` (text) — raw YAML blob, so arbitrary per-note fields
     remain searchable even though they are not schema fields
-  - `body` (text, stored) — note content
-  Index writer: 1 thread, ~10 MB arena. `notify` watcher debounces events and
-  re-indexes changed notes (delete-by-path-term + re-add). Schema changes
-  trigger a full rebuild (admin path, not an MCP tool).
+  - `body` (text, stored) — note content, stored so result snippets come
+    from the index instead of re-reading files
+  Index writer: 1 thread, 16 MB arena (tantivy enforces a 15 MB minimum).
+  Query parsing: conjunction (AND) by default, title boosted ×2, snippets
+  via tantivy's `SnippetGenerator`.
+  Freshness: full rebuild at startup (changes pulled while the server was
+  down leave no watcher events), then a `notify` watcher thread batches
+  debounced events (1 s quiet window, 30 s max batch) into
+  delete-by-path-term + re-add commits. The reader uses the manual reload
+  policy, reloaded right after every commit. An index directory built by
+  a different server version (schema mismatch) is an error for an
+  administrator to resolve, not silently rebuilt.
 - **sync** — spawns `ob sync --continuous --path <vault>` at startup,
   restarts it with backoff on exit, logs its output. `sync_status` runs
   `ob sync-status` on demand; `sync_now` runs a one-shot `ob sync`.
@@ -150,15 +161,18 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
 
 ## Build phases
 
-1. **Scaffold + config + vault module** — cargo project, dependency set,
-   config, sandboxed vault I/O with tests.
-2. **Markdown + read tools** — frontmatter/wikilink/tag parsing, link graph,
-   `list_notes`, `read_note`, `get_backlinks`, `get_outlinks`, `list_tags`.
-3. **Sync supervisor** — child process management, restart with backoff,
-   `sync_status` / `sync_now`.
-4. **HTTP transport + auth** — rmcp server over streamable HTTP, bearer
-   token middleware, end-to-end smoke test.
-5. **Search** — tantivy index, notify watcher, `search_notes`.
+1. ~~**Scaffold + config + vault module**~~ — done (cargo project, dependency
+   set, config, sandboxed vault I/O with tests).
+2. ~~**Markdown + read tools**~~ — done (frontmatter/wikilink/tag parsing,
+   link graph, `list_notes`, `read_note`, `get_backlinks`, `get_outlinks`,
+   `list_tags`).
+3. ~~**Sync supervisor**~~ — done (child process management, restart with
+   backoff, `sync_status` / `sync_now`).
+4. ~~**HTTP transport + auth**~~ — done (rmcp server over streamable HTTP,
+   bearer token middleware, end-to-end smoke test).
+5. ~~**Search** — tantivy index, notify watcher, `search_notes`.~~ — done
+   (startup rebuild + debounced incremental updates; 11 unit tests plus
+   E2E coverage including live re-indexing).
 6. **Write tools** — `write_note`, `patch_note`, `move_note` (link rewrite),
    `delete_note`, `daily_note`.
 7. **Deployment** — Dockerfile (multi-stage, distroless/static), systemd unit,
