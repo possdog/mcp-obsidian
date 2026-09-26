@@ -1,8 +1,10 @@
 use clap::Parser;
 use mcp_obsidian::config::Config;
+use mcp_obsidian::sync::SyncSupervisor;
 use mcp_obsidian::vault::Vault;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -27,12 +29,21 @@ fn main() {
         }
     };
 
-    // Phase 1 scope: configuration and the sandboxed vault layer. The MCP
-    // handler, sync supervisor, and search index arrive in phases 2-5.
+    // The sync daemon runs as a supervised child: `ob login` and
+    // `ob sync-setup` happen out-of-band on the host before startup.
+    let supervisor = SyncSupervisor::start(&config.ob_bin, vault.root());
+
     tracing::info!(
         vault = %vault.root().display(),
         index_dir = %index_dir.display(),
         bind = %config.bind_addr,
-        "mcp-obsidian started (phase 1: vault layer only)"
+        "mcp-obsidian started (phase 3: sync supervision; MCP handler arrives in phase 4)"
     );
+
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::error!(error = %e, "failed to listen for ctrl-c");
+        std::process::exit(1);
+    }
+    tracing::info!("ctrl-c received; shutting down");
+    supervisor.stop().await;
 }
