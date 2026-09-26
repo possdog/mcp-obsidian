@@ -118,8 +118,11 @@ The image bundles the server binary and the `ob` CLI; the runtime stage is
 ```sh
 docker build -t mcp-obsidian .
 
-# Prepare host directories owned by UID 1000 (the container's `node` user)
-mkdir vault config && sudo chown -R 1000:1000 vault config
+# Prepare host directories owned by UID 1000 (the container's `node` user).
+# `index` holds the search index: the image defaults INDEX_DIR to /index,
+# and a volume there persists it across container recreation (the server
+# fully rebuilds it at startup otherwise).
+mkdir vault config index && sudo chown -R 1000:1000 vault config index
 
 # One-off interactive setup, using the image itself as the `ob` CLI.
 # Credentials land in ./config (mounted at /config) and persist.
@@ -132,7 +135,7 @@ docker run -it --rm \
   --entrypoint ob mcp-obsidian sync-setup --vault "My Vault" --path /vault
 
 docker run -d --init --name mcp-obsidian --restart unless-stopped \
-  -v "$PWD/vault:/vault" -v "$PWD/config:/config" \
+  -v "$PWD/vault:/vault" -v "$PWD/config:/config" -v "$PWD/index:/index" \
   -e AUTH_TOKEN="$(openssl rand -hex 32)" \
   -p 127.0.0.1:8080:8080 \
   mcp-obsidian

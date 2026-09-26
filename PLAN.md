@@ -210,7 +210,9 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
    the server supervises `ob` (a Node 22+ CLI) as a child process, so the
    runtime stage is `node:22-alpine` with `obsidian-headless` installed
    and the musl-linked server binary; a shell-free distroless image cannot
-   host `ob`. Docker build not verified (no Docker on the dev machine).
+   host `ob`. The image build and a container smoke test are verified
+   (docker build; `ob --version` inside the image; server started, `401`
+   without a bearer token, full MCP `initialize` round trip with it).
 
 ## Deployment (phase 7, as built)
 
@@ -232,7 +234,10 @@ Artifacts:
 - `Dockerfile` — multi-stage: `rust:1-alpine` build (musl, stub-source
   dependency-caching layer) → `node:22-alpine` runtime with
   `obsidian-headless` installed, non-root `node` user (UID 1000),
-  `XDG_CONFIG_HOME=/config` so `ob` credentials persist on a mounted volume.
+  `XDG_CONFIG_HOME=/config` so `ob` credentials persist on a mounted volume,
+  and `INDEX_DIR=/index` (pre-created, `node`-owned) because the vault's
+  default index location (a sibling of `/vault`) would land on the
+  unwritable container root.
 - `deploy/mcp-obsidian.service` — systemd unit: dedicated user, environment
   file at `/etc/mcp-obsidian/env`, `ProtectSystem=strict` with explicit
   `ReadWritePaths` (ProtectHome deliberately unset: `ob` credentials may

@@ -13,10 +13,15 @@ RUN mkdir src \
  && echo 'pub fn unused() {}' > src/lib.rs \
  && echo 'fn main() {}' > src/main.rs \
  && cargo build --release --locked \
- && rm -rf src target/release/deps/mcp_obsidian* target/release/mcp-obsidian
+ && rm -rf src target/release/deps/mcp_obsidian* target/release/deps/libmcp_obsidian* \
+           target/release/mcp-obsidian
 
 COPY src ./src
-RUN cargo build --release --locked
+# COPY preserves the original mtimes of the real sources, which are older
+# than the fingerprints recorded during the stub build; cargo would then
+# wrongly consider the stubbed lib rlib fresh and link the bin against an
+# empty lib. Touching the sources forces the lib and bin to rebuild.
+RUN touch src/lib.rs src/main.rs && cargo build --release --locked
 
 # --- Runtime stage.
 #
@@ -31,6 +36,10 @@ FROM node:22-alpine AS runtime
 RUN npm install --global obsidian-headless \
  && npm cache clean --force
 
+# Search-index default location; owned by the runtime user so the server
+# can create and write it.
+RUN mkdir /index && chown node:node /index
+
 COPY --from=build /build/target/release/mcp-obsidian /usr/local/bin/mcp-obsidian
 
 # `ob` stores its auth token and per-vault sync config under
@@ -40,9 +49,14 @@ COPY --from=build /build/target/release/mcp-obsidian /usr/local/bin/mcp-obsidian
 ENV XDG_CONFIG_HOME=/config
 
 # Sensible in-container defaults; AUTH_TOKEN still has to be provided.
-# The listener must bind all interfaces to be reachable through the
-# published port; it remains token-gated.
+# - The listener must bind all interfaces to be reachable through the
+#   published port; it remains token-gated.
+# - The vault is mounted at /vault, so the index-dir default (a sibling of
+#   the vault) would land on the unwritable container root. /index is
+#   pre-created below; mount a volume there to persist the index across
+#   container recreation (the server rebuilds it at startup otherwise).
 ENV VAULT_PATH=/vault \
+    INDEX_DIR=/index \
     BIND_ADDR=0.0.0.0:8080
 
 # node:22-alpine ships a non-root `node` user (UID 1000). Bind mounts on the
