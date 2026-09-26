@@ -440,6 +440,42 @@ mod tests {
     }
 
     #[test]
+    fn link_graph_ignores_escape_attempts() {
+        // Wikilinks and markdown links are resolved against in-memory
+        // tables, never against the filesystem, so hostile link targets
+        // cannot probe outside the vault: traversal clamps at the vault
+        // root and then fails to match any known path. The legitimate
+        // link in the same note is the positive control — a resolver
+        // that refused *everything* would pass a refusal-only test.
+        let (notes, _d) = vault_with_notes(&[
+            (
+                "evil.md",
+                "[[Note]] [[../../etc/passwd]] [[..]] [p](../../../etc/passwd) \
+                 [f](file:///etc/passwd) [w](My%2e%2e/Note.md) [abs](/etc/passwd)",
+            ),
+            ("Note.md", "innocent"),
+        ]);
+        let index = notes.link_index().expect("index builds");
+        let out: Vec<_> = index
+            .outlinks("evil.md")
+            .iter()
+            .map(|o| o.target.as_str())
+            .collect();
+        assert_eq!(out, ["Note.md"], "only the legitimate link may resolve");
+        let back = index.backlinks("Note.md");
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].source, "evil.md");
+    }
+
+    #[test]
+    fn read_is_lossy_for_invalid_utf8() {
+        let (notes, d) = vault_with_notes(&[]);
+        std::fs::write(d.path().join("bin.md"), [0x41, 0xff, 0x42]).expect("write");
+        let read = notes.read("bin.md", None).expect("lossy read");
+        assert_eq!(read.body, "A\u{fffd}B");
+    }
+
+    #[test]
     fn read_with_and_without_heading() {
         let (notes, _d) = vault_with_notes(&[(
             "n.md",

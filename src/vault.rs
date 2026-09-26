@@ -326,7 +326,23 @@ impl Vault {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            target = trash.join(format!("{stem}.{stamp}{ext}"));
+            // The timestamp only has second resolution, so two same-named
+            // deletions within one second (or a pre-existing stamped entry)
+            // would collide; keep bumping a counter until the name is free
+            // so no trashed copy is ever clobbered.
+            let mut counter = 0u64;
+            loop {
+                let stamped = if counter == 0 {
+                    format!("{stem}.{stamp}{ext}")
+                } else {
+                    format!("{stem}.{stamp}.{counter}{ext}")
+                };
+                target = trash.join(stamped);
+                if !target.exists() {
+                    break;
+                }
+                counter += 1;
+            }
         }
         fs::rename(&path, &target)?;
         let trashed = target
@@ -350,6 +366,123 @@ mod tests {
 
     fn write(v: &Vault, rel: &str, contents: &str) {
         v.write(rel, contents.as_bytes()).expect("write succeeds");
+    }
+
+    #[test]
+    fn resolve_treats_percent_traversal_as_a_literal_filename() {
+        let (v, dir) = vault();
+        // The sandbox works on raw strings: percent sequences are never
+        // URL-decoded, so "%2e%2e" is a literal (odd) directory name that
+        // stays inside the vault rather than meaning "..".
+        assert!(v.write("%2e%2e/escape.md", b"hi").is_ok());
+        assert!(dir.path().join("%2e%2e/escape.md").exists());
+        assert!(v.read("%2e%2e/escape.md").is_ok());
+        assert!(!dir.path().parent().unwrap().join("escape.md").exists());
+        // Dot-prefixed segments are dot-folders for this purpose, so a
+        // file literally named "..md" is refused like ".obsidian" is.
+        assert!(v.resolve("..md", false).is_err());
+        // NUL bytes and backslash separators are refused outright.
+        assert!(v.resolve("note\0.md", false).is_err());
+        assert!(v.resolve("note\\.md", false).is_err());
+    }
+
+    #[test]
+    fn resolve_normalizes_redundant_separators() {
+        let (v, _d) = vault();
+        write(&v, "a/b.md", "hi");
+        // Empty and "." segments vanish, so these all address the same
+        // note — no escape is possible because ".." is still rejected.
+        assert!(v.read("a//b.md").is_ok());
+        assert!(v.read("./a/./b.md").is_ok());
+        assert!(v.read("a/b.md/").is_ok());
+        assert!(v.read("a/./../b.md").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinks_are_rejected_at_every_position() {
+        let (v, dir) = vault();
+        let outside = tempfile::tempdir().expect("tempdir");
+        fs::write(outside.path().join("secret.md"), "secret").unwrap();
+        // Three link shapes: a directory component, a leaf file, and a
+        // link that currently points *inside* the vault (a client could
+        // retarget it later, so it is refused too).
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.md"),
+            dir.path().join("filelink.md"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("inlink")).unwrap();
+        fs::create_dir_all(dir.path().join("real")).unwrap();
+        fs::write(dir.path().join("real/legit.md"), "ok").unwrap();
+
+        for bad in ["dirlink/secret.md", "filelink.md", "inlink/legit.md"] {
+            assert!(v.read(bad).is_err(), "read should reject {bad:?}");
+            assert!(v.write(bad, b"x").is_err(), "write should reject {bad:?}");
+            assert!(v.delete(bad).is_err(), "delete should reject {bad:?}");
+            assert!(
+                v.rename(bad, "copy.md", false).is_err(),
+                "rename should reject {bad:?}"
+            );
+        }
+        // A listing prefix through a symlink is refused as well.
+        assert!(v.list(Some("dirlink")).is_err());
+        assert!(v.list(Some("dirlink/")).is_err());
+        // The outside file was never read through a link, let alone
+        // modified, and the real note remains reachable.
+        assert_eq!(
+            fs::read(outside.path().join("secret.md")).unwrap(),
+            b"secret"
+        );
+        assert!(v.read("real/legit.md").is_ok());
+    }
+
+    #[test]
+    fn directories_refuse_read_write_rename_delete() {
+        let (v, dir) = vault();
+        write(&v, "note.md", "x");
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        // Writing onto a directory must not clobber it.
+        assert!(matches!(v.write("sub", b"x"), Err(VaultError::Exists(_))));
+        assert!(v.read("sub").is_err());
+        assert!(v.delete("sub").is_err());
+        assert!(v.rename("sub", "moved.md", false).is_err());
+        // A file in the middle of a path is a shape error, not an escape.
+        assert!(matches!(
+            v.write("note.md/child.md", b"x"),
+            Err(VaultError::InvalidPath(_))
+        ));
+        // Postconditions: every refusal above must have been a refusal.
+        // An implementation that performed the operation and then
+        // returned an error would pass is_err() assertions alone.
+        assert!(dir.path().join("sub").is_dir(), "directory must survive");
+        assert!(
+            !dir.path().join("moved.md").exists(),
+            "rename must not have happened"
+        );
+        assert!(dir.path().join("note.md").is_file(), "note.md must survive");
+        assert!(!dir.path().join("note.md/child.md").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_canonicalizes_a_symlinked_root() {
+        // Opening the vault through a symlink to its real directory must
+        // canonicalize: the sandbox's outside-the-root reasoning is only
+        // sound against the real path.
+        let real = tempfile::tempdir().expect("tempdir");
+        fs::write(real.path().join("n.md"), "x").expect("write");
+        let link_parent = tempfile::tempdir().expect("tempdir");
+        let link = link_parent.path().join("vault-link");
+        std::os::unix::fs::symlink(real.path(), &link).expect("symlink");
+        let v = Vault::open(&link).expect("opens through symlink");
+        assert_eq!(
+            v.root(),
+            &real.path().canonicalize().expect("canonicalize real"),
+            "the sandbox root must be the real directory"
+        );
+        assert!(v.read("n.md").is_ok());
     }
 
     #[test]
@@ -486,5 +619,36 @@ mod tests {
         let trashed2 = v.delete("sub/n.md").unwrap();
         assert_ne!(trashed1, trashed2, "collision should get a unique name");
         assert_eq!(fs::read(dir.path().join(".trash/n.md")).unwrap(), b"first");
+    }
+
+    #[test]
+    fn delete_stamped_collision_gets_fresh_name() {
+        let (v, dir) = vault();
+        // Force stamping: a trash entry with the target filename already
+        // exists.
+        fs::create_dir_all(dir.path().join(".trash")).expect("mkdir trash");
+        fs::write(dir.path().join(".trash/n.md"), "ancient").expect("seed trash");
+        write(&v, "a/n.md", "first");
+        let trashed1 = v.delete("a/n.md").unwrap();
+        assert_ne!(trashed1, ".trash/n.md");
+
+        // Occupy the stamped name (as a same-second second deletion would),
+        // then delete another same-named note: the loop must pick a fresh
+        // name instead of overwriting the first trashed copy.
+        let occupied = dir.path().join(&trashed1);
+        fs::write(&occupied, "first-copy").expect("occupy stamped name");
+        write(&v, "b/n.md", "second");
+        let trashed2 = v.delete("b/n.md").unwrap();
+        assert_ne!(trashed1, trashed2, "stamped collision needs a fresh name");
+        assert_eq!(
+            fs::read(&occupied).unwrap(),
+            b"first-copy",
+            "the first trashed copy must survive"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(&trashed2)).unwrap(),
+            b"second",
+            "the second trashed copy must land at its own name"
+        );
     }
 }

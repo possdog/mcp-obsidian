@@ -944,6 +944,99 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_rejects_malicious_paths_on_every_operation() {
+        let (w, _d) = writes();
+        w.write_note("hello.md", "hi\n", None, false).expect("seed");
+        // Traversal, absolute paths, dot-folders, NUL, backslashes, and
+        // the empty path are refused by every write tool, not just
+        // write_note — a misaligned agent cannot pick a friendlier entry
+        // point to smuggle a path through.
+        for bad in [
+            "../evil.md",
+            "a/../../evil.md",
+            "/tmp/evil.md",
+            ".obsidian/app.json",
+            ".trash/hello.md",
+            "evil\0.md",
+            "a\\evil.md",
+            "",
+        ] {
+            assert!(
+                w.write_note(bad, "x", None, false).is_err(),
+                "write_note should reject {bad:?}"
+            );
+            assert!(
+                w.patch_note(bad, PatchOp::Append, "x", None).is_err(),
+                "patch_note should reject {bad:?}"
+            );
+            assert!(
+                w.delete_note(bad).is_err(),
+                "delete_note should reject {bad:?}"
+            );
+            assert!(
+                w.move_note("hello.md", bad, false, true).is_err(),
+                "move_note target should reject {bad:?}"
+            );
+            assert!(
+                w.move_note(bad, "moved.md", false, true).is_err(),
+                "move_note source should reject {bad:?}"
+            );
+        }
+        // The victim note is untouched by all those attempts.
+        assert_eq!(read(&w, "hello.md"), "hi\n");
+    }
+
+    #[test]
+    fn daily_note_settings_cannot_escape_the_vault() {
+        // A tampered .obsidian/daily-notes.json, a hostile DAILY_NOTES_DIR,
+        // or a malicious format string all funnel into the same sandboxed
+        // write: traversal in either field is rejected, and nothing lands
+        // outside the vault.
+        let (w, dir) = writes_with(DailyNoteSettings {
+            dir: Some("../outside".into()),
+            format: Some("YYYY-MM-DD.md".into()),
+        });
+        assert!(
+            w.daily_note(DailyAction::Create, Some("2026-09-25"), None)
+                .is_err()
+        );
+        assert!(!dir.path().parent().unwrap().join("outside").exists());
+
+        let (w, _d) = writes_with(DailyNoteSettings {
+            dir: Some("Days".into()),
+            format: Some("../../../evil.md".into()),
+        });
+        assert!(
+            w.daily_note(DailyAction::Create, Some("2026-09-25"), None)
+                .is_err()
+        );
+
+        // The vault's own daily-notes config is equally sandboxed: a
+        // dot-folder or traversal there is rejected at write time.
+        let (w, d) = writes();
+        std::fs::create_dir_all(d.path().join(".obsidian")).expect("mkdir");
+        std::fs::write(
+            d.path().join(".obsidian/daily-notes.json"),
+            r#"{"folder": ".trash"}"#,
+        )
+        .expect("config");
+        assert!(
+            w.daily_note(DailyAction::Create, Some("2026-09-25"), None)
+                .is_err()
+        );
+
+        // A date that smuggles path syntax is rejected before any path
+        // is built.
+        let (w, _d) = writes();
+        for bad in ["2026-09-25/../evil", "2026/09/25", "../../../2026-09-25"] {
+            assert!(
+                w.daily_note(DailyAction::Create, Some(bad), None).is_err(),
+                "date should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn patch_note_insert_into_last_heading_without_newline() {
         let (w, _d) = writes();
         w.write_note("tail.md", "## Log", None, false)
@@ -1063,6 +1156,98 @@ mod tests {
             Err(VaultError::NotFound(_))
         ));
         assert!(w.vault.list(None).expect("list").is_empty());
+    }
+
+    #[test]
+    fn case_only_rename_is_safe_regardless_of_filesystem_case() {
+        let (w, d) = writes();
+        w.write_note("Case.md", "content\n", None, false)
+            .expect("seed");
+        w.write_note("l.md", "[[case]]\n", None, false)
+            .expect("linker");
+
+        // Detect how this filesystem treats names differing only in case
+        // (default APFS: same file; ext4: distinct files) and pin the
+        // behavior that must hold on both.
+        let case_insensitive = d.path().join("case.md").exists();
+        if case_insensitive {
+            // The target "exists" (it is the same file), so without the
+            // overwrite flag the move is refused rather than quietly
+            // treating the note's own name as free.
+            assert!(matches!(
+                w.move_note("Case.md", "case.md", false, true),
+                Err(VaultError::Exists(_))
+            ));
+        }
+        // With the flag it is a safe rename: content survives, the old
+        // exact-case name is gone on case-sensitive filesystems, and a
+        // bare-name wikilink is not mangled into something stranger.
+        let out = w
+            .move_note("Case.md", "case.md", true, true)
+            .expect("case rename");
+        assert!(out.message.starts_with("Moved Case.md to case.md"));
+        assert_eq!(read(&w, "case.md"), "content\n");
+        if !case_insensitive {
+            assert!(matches!(
+                w.vault.read("Case.md"),
+                Err(VaultError::NotFound(_))
+            ));
+        }
+        assert_eq!(read(&w, "l.md"), "[[case]]\n");
+    }
+
+    #[test]
+    fn patch_note_preserves_crlf_note_content() {
+        let (w, _d) = writes();
+        w.vault
+            .write(
+                "crlf.md",
+                b"---\r\ntitle: C\r\n---\r\n# Top\r\nbody line\r\n",
+            )
+            .expect("seed");
+        w.patch_note("crlf.md", PatchOp::Append, "added\r\n", None)
+            .expect("append");
+        let raw = read(&w, "crlf.md");
+        // The frontmatter block survives byte-for-byte and no body text
+        // is lost, even though the block joiner normalizes only \n.
+        assert!(
+            raw.starts_with("---\r\ntitle: C\r\n---\r\n"),
+            "got: {raw:?}"
+        );
+        assert!(raw.contains("# Top\r\nbody line"), "got: {raw:?}");
+        assert!(raw.contains("added"), "got: {raw:?}");
+        // Headings in a CRLF note still anchor patches.
+        w.patch_note(
+            "crlf.md",
+            PatchOp::InsertAtHeading,
+            "inserted\r\n",
+            Some("top"),
+        )
+        .expect("insert");
+        let raw = read(&w, "crlf.md");
+        assert!(raw.contains("inserted"), "got: {raw:?}");
+        assert!(raw.contains("body line"), "got: {raw:?}");
+    }
+
+    #[test]
+    fn move_note_rewrites_links_in_crlf_notes() {
+        let (w, _d) = writes();
+        w.write_note("target.md", "x\n", None, false)
+            .expect("target");
+        w.write_note(
+            "l.md",
+            "See [[target]] here.\r\nAnd [md](target.md) too.\r\n",
+            None,
+            false,
+        )
+        .expect("linker");
+        w.move_note("target.md", "moved.md", false, true)
+            .expect("move");
+        let raw = read(&w, "l.md");
+        assert!(raw.contains("[[moved]]"), "got: {raw:?}");
+        assert!(raw.contains("(moved.md)"), "got: {raw:?}");
+        // The splice is byte-local: untouched line endings stay CRLF.
+        assert!(raw.ends_with("too.\r\n"), "got: {raw:?}");
     }
 
     #[test]

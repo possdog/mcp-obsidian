@@ -34,9 +34,13 @@ ExecStart=/usr/local/bin/mcp-obsidian
 Restart=on-failure
 RestartSec=5
 
-# Hardening. Note that ProtectHome is deliberately NOT set: the vault and
-# the `ob` credentials may live under /home, and both the server and `ob`
-# must be able to read/write there.
+# Hardening. Note that ProtectHome is deliberately NOT set and that
+# ProtectSystem=strict makes the whole hierarchy read-only outside the
+# ReadWritePaths list: `ob`'s auth token under the user's home only needs
+# to be READ at runtime (it is written out-of-band by `ob login`), and
+# `ob`'s per-vault sync state lives inside the vault directory, which is
+# listed. If your `ob` version refreshes credentials at runtime, add its
+# config directory (e.g. /home/obsidian/.config) to ReadWritePaths.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

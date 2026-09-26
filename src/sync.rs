@@ -462,6 +462,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_utf8_ob_output_is_captured_lossily() {
+        let dir = temp_dir();
+        // Invalid UTF-8 on both pipes must not fail the run: output is
+        // captured lossily, keeping the readable parts (and the invalid
+        // bytes become U+FFFD rather than aborting the tool call).
+        let script = write_script(
+            dir.path(),
+            "ob-lossy",
+            "#!/bin/sh\nprintf 'ok \\377\\376 out\\n'\nprintf 'bad \\377\\n' >&2\nexit 0\n",
+        );
+        let outcome = sync_status(&script_bin(&script), dir.path()).await;
+        assert!(outcome.success, "stderr: {:?}", outcome.stderr);
+        assert!(
+            outcome.stdout.contains("ok"),
+            "stdout readable parts must survive: {:?}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.stdout.contains('\u{fffd}'),
+            "invalid bytes must be lossy-converted: {:?}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.stderr.contains('\u{fffd}'),
+            "stderr invalid bytes must be lossy-converted: {:?}",
+            outcome.stderr
+        );
+    }
+
+    #[tokio::test]
     async fn sync_status_captures_output() {
         let dir = temp_dir();
         let script = write_script(dir.path(), "ob", "#!/bin/sh\necho 'vault: synced'\n");

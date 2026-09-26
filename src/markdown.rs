@@ -433,6 +433,23 @@ mod tests {
     }
 
     #[test]
+    fn split_frontmatter_crlf_and_embedded_fences() {
+        // CRLF fences are recognized on both the opening and the
+        // closing line, and the block keeps its \r\n bytes verbatim.
+        let (fm, body) = split_frontmatter("---\r\ntitle: A\r\n---\r\n# Body\r\n");
+        assert_eq!(fm.unwrap(), "---\r\ntitle: A\r\n---\r\n");
+        assert_eq!(body, "# Body\r\n");
+
+        // The FIRST closing fence ends the block: a "---" line later in
+        // the file is body content, not a second frontmatter document.
+        // Pinning this keeps frontmatter handling from accidentally
+        // becoming a "find any two fences" scan.
+        let (fm, body) = split_frontmatter("---\na: 1\n---\nstill fm?\n---\nbody");
+        assert_eq!(fm.unwrap(), "---\na: 1\n---\n");
+        assert_eq!(body, "still fm?\n---\nbody");
+    }
+
+    #[test]
     fn wikilink_variants() {
         let body = "[[Foo]] [[Bar|alias]] [[Baz#Heading]] [[Qux#^block]] [[Qux#H#^b]] \
                     ![[img.png]] [[#self]] [[dir/Sub]]";

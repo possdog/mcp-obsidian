@@ -1,5 +1,7 @@
 # mcp-obsidian
 
+> 🤖 This code was written by a human-led AI agent.
+
 An [MCP](https://modelcontextprotocol.io) server that gives AI agents read and
 write access to an [Obsidian](https://obsidian.md) vault, designed to run on a
 remote server (VPS) and serve any MCP-compatible client — including clients

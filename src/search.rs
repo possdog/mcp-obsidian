@@ -220,9 +220,6 @@ impl SearchIndex {
     /// Incrementally updates the index for a set of vault-relative paths:
     /// each existing note is deleted and re-added with its current content,
     /// a missing note is only deleted. One commit for the whole batch.
-    /// Incrementally updates the index for a set of vault-relative paths:
-    /// each existing note is deleted and re-added with its current content,
-    /// a missing note is only deleted. One commit for the whole batch.
     pub fn reindex_paths<P: AsRef<str>>(
         &self,
         vault: &Vault,
@@ -817,6 +814,64 @@ mod tests {
             start.elapsed() < Duration::from_secs(4),
             "stop took too long"
         );
+    }
+
+    #[test]
+    fn prefix_filter_is_literal_not_regex() {
+        let (vault, _v, index, _i) = fixture();
+        for dir in ["a(b", "ab"] {
+            std::fs::create_dir_all(vault.root().join(dir)).expect("mkdir");
+            std::fs::write(
+                vault.root().join(format!("{dir}/note.md")),
+                "# Note\n\nxylophone\n",
+            )
+            .expect("write");
+        }
+        index.build_all(&vault).expect("build");
+
+        // Regex metacharacters in a prefix match literally (never panic,
+        // never widen the filter to other notes).
+        let hits = index.search("xylophone", Some("a(b"), 10).expect("search");
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, ["a(b/note.md"]);
+        // A traversal-shaped prefix is just a literal that matches nothing.
+        let hits = index.search("xylophone", Some("../"), 10).expect("search");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn hostile_queries_fail_gracefully() {
+        let (_vault, _v, index, _i) = seeded_index();
+        // Unbalanced or unclosed syntax is a query error the tool layer
+        // reports to the caller, never a panic.
+        for hostile in ["(((", "\"unclosed"] {
+            assert!(
+                matches!(index.search(hostile, None, 10), Err(SearchError::Query(_))),
+                "{hostile:?} should be a query error"
+            );
+        }
+        // An empty query is valid and simply matches nothing.
+        assert_eq!(paths(&index, ""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn unicode_terms_are_searchable() {
+        let (vault, _v, index, _i) = fixture();
+        std::fs::write(
+            vault.root().join("accents.md"),
+            "# Café\n\nA naïve façade discussion.\n",
+        )
+        .expect("write");
+        index.build_all(&vault).expect("build");
+        // The query tokenizer and the indexing tokenizer must agree on
+        // non-ASCII terms.
+        assert_eq!(paths(&index, "café"), ["accents.md"]);
+        assert_eq!(paths(&index, "naïve"), ["accents.md"]);
+        // Case folding covers non-ASCII, not just ASCII.
+        assert_eq!(paths(&index, "CAFÉ"), ["accents.md"]);
+        // An accented query must not match the unaccented word: diacritics
+        // are significant, so "facade" does not retrieve "façade".
+        assert!(paths(&index, "facade").is_empty());
     }
 
     #[test]

@@ -275,8 +275,11 @@ impl ObsidianHandler {
             Err(e) => return tool_error(e),
         };
         let mut out = String::new();
+        // The frontmatter block from Notes::read already carries its `---`
+        // fences (and trailing newline); push it verbatim or the fences end
+        // up doubled.
         if let Some(frontmatter) = read.frontmatter {
-            let _ = writeln!(out, "---\n{frontmatter}\n---");
+            out.push_str(&frontmatter);
         }
         out.push_str(&read.body);
         text(out)
@@ -712,6 +715,94 @@ mod tests {
         let capped = cap_output(multibyte);
         assert!(capped.contains("output truncated"));
         assert!(capped.chars().all(|c| c != '\u{fffd}'));
+    }
+
+    #[test]
+    fn parse_bearer_rejects_malformed_authorization_values() {
+        // Whitespace stays part of the token, so padded guesses ("Bearer
+        // tok ") or doubled separators ("Bearer  tok") fail the equality
+        // check rather than being trimmed into a match.
+        assert_eq!(parse_bearer("Bearer "), Some(""));
+        assert_eq!(parse_bearer("Bearer  tok"), Some(" tok"));
+        assert_eq!(parse_bearer("Bearer tok extra"), Some("tok extra"));
+        // Tab-separated values are not bearer headers at all.
+        assert_eq!(parse_bearer("Bearer\ttok"), None);
+        assert_eq!(parse_bearer(" Bearer tok"), None);
+    }
+
+    #[test]
+    fn empty_bearer_token_never_authenticates() {
+        let expected = AuthToken::new("real-token");
+        for provided in ["", " ", "real-token ", " real-token", "REAL-TOKEN"] {
+            assert!(
+                !constant_time_eq(provided.as_bytes(), &expected.0),
+                "{provided:?} must not authenticate"
+            );
+        }
+    }
+
+    #[test]
+    fn cap_output_at_exact_boundary() {
+        // Exactly at the cap: unchanged, no truncation marker.
+        let exact = "x".repeat(MAX_TOOL_OUTPUT);
+        let capped = cap_output(exact.clone());
+        assert_eq!(capped, exact);
+        // One byte over: the marker appears and the original size is
+        // reported.
+        let over = format!("{}y", exact);
+        let capped = cap_output(over);
+        assert!(capped.contains("output truncated"));
+        assert!(capped.contains(&format!("of {}", MAX_TOOL_OUTPUT + 1)));
+    }
+
+    #[test]
+    fn format_supervision_renders_state_and_outcome() {
+        use crate::sync::{SupervisorState, SyncRunOutcome};
+
+        // Degraded: daemon up but with history, one-shot command timed
+        // out; stdout empty, so stderr is the best output.
+        let state = SupervisorState {
+            running: true,
+            restarts: 2,
+            last_exit_code: Some(1),
+            last_error: Some("ob exploded".into()),
+            ..SupervisorState::default()
+        };
+        let outcome = SyncRunOutcome {
+            success: false,
+            exit_code: None,
+            timed_out: true,
+            stdout: String::new(),
+            stderr: "gave up waiting".into(),
+        };
+        let text = format_supervision("sync", &state, &outcome);
+        assert!(
+            text.contains("daemon: running (restarts: 2)"),
+            "got: {text}"
+        );
+        assert!(text.contains("daemon error: ob exploded"), "got: {text}");
+        assert!(text.contains("last daemon exit: 1"), "got: {text}");
+        assert!(text.contains("ob sync: timed out"), "got: {text}");
+        assert!(text.contains("gave up waiting"), "got: {text}");
+
+        // Healthy: stopped daemon, ok one-shot, stdout preferred over
+        // stderr.
+        let state = SupervisorState::default();
+        let outcome = SyncRunOutcome {
+            success: true,
+            exit_code: Some(0),
+            timed_out: false,
+            stdout: "all synced".into(),
+            stderr: "ignored".into(),
+        };
+        let text = format_supervision("sync-status", &state, &outcome);
+        assert!(
+            text.contains("daemon: stopped (restarts: 0)"),
+            "got: {text}"
+        );
+        assert!(text.contains("ob sync-status: ok"), "got: {text}");
+        assert!(text.contains("all synced"), "got: {text}");
+        assert!(!text.contains("ignored"), "got: {text}");
     }
 
     #[test]
