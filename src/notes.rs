@@ -116,29 +116,7 @@ impl Notes {
     pub fn link_index(&self) -> Result<LinkIndex> {
         let entries = self.vault.list(None)?;
         let mut index = LinkIndex::default();
-
-        // Resolution tables. Obsidian matches link targets
-        // case-insensitively regardless of filesystem, so keys are
-        // lowercased. Two tables: full paths, and basenames (filename with
-        // extension; `.md` files additionally get a key without their
-        // extension so `[[note]]` works).
-        let mut by_path: HashMap<String, String> = HashMap::new();
-        let mut by_basename: HashMap<String, Vec<String>> = HashMap::new();
-        for entry in &entries {
-            let path = &entry.path;
-            by_path.insert(path.to_lowercase(), path.clone());
-            let file_name = path.rsplit('/').next().unwrap_or(path);
-            by_basename
-                .entry(file_name.to_lowercase())
-                .or_default()
-                .push(path.clone());
-            if let Some(stem) = file_name.strip_suffix(".md") {
-                by_basename
-                    .entry(stem.to_lowercase())
-                    .or_default()
-                    .push(path.clone());
-            }
-        }
+        let tables = LinkTables::build(entries.iter().map(|e| e.path.clone()));
 
         for entry in &entries {
             if !entry.path.ends_with(".md") {
@@ -159,7 +137,7 @@ impl Notes {
             // links stay body-only: URLs are common in frontmatter and add
             // only external links, which the graph skips anyway.
             for link in markdown::parse_wikilinks(&raw) {
-                if let Some(target) = self.resolve_wikilink(&link.target, &by_path, &by_basename) {
+                if let Some(target) = tables.resolve_wikilink(&link.target) {
                     outlinks.push(OutLink {
                         target,
                         display: link.alias.unwrap_or_else(|| link.target.clone()),
@@ -172,10 +150,9 @@ impl Notes {
                     continue;
                 }
                 let decoded = markdown::percent_decode(&link.target);
-                let joined = normalize_join(&source_dir, &decoded);
                 // Markdown links are relative to the note, so resolve via
                 // the full-path table only.
-                if let Some(target) = by_path.get(&joined.to_lowercase()) {
+                if let Some(target) = tables.resolve_md_link(&source_dir, &decoded) {
                     outlinks.push(OutLink {
                         target: target.clone(),
                         display: if link.text.is_empty() {
@@ -203,43 +180,6 @@ impl Notes {
             }
         }
         Ok(index)
-    }
-
-    /// Resolves one wikilink target against the tables, mirroring
-    /// Obsidian's rules:
-    /// - empty target = intra-note link, resolves to the note itself;
-    /// - targets containing `/` are vault-root paths (with or without
-    ///   `.md`, with extension required for attachments);
-    /// - bare names match by filename anywhere in the vault;
-    /// - ambiguity between same-named notes resolves to the shortest
-    ///   path (Obsidian's "shortest path" resolution).
-    fn resolve_wikilink(
-        &self,
-        target: &str,
-        by_path: &HashMap<String, String>,
-        by_basename: &HashMap<String, Vec<String>>,
-    ) -> Option<String> {
-        let target = target.trim();
-        if target.is_empty() {
-            return None; // intra-note links do not enter the graph
-        }
-        if target.contains('/') {
-            let lower = target.to_lowercase();
-            return by_path
-                .get(&lower)
-                .or_else(|| by_path.get(&format!("{lower}.md")))
-                .cloned();
-        }
-        let candidates = by_basename.get(&target.to_lowercase())?;
-        match candidates.len() {
-            0 | 1 => candidates.first().cloned(),
-            // Shortest path (fewest segments), lexicographic tiebreak for
-            // deterministic output.
-            _ => candidates
-                .iter()
-                .min_by_key(|p| (p.split('/').count(), p.to_string()))
-                .cloned(),
-        }
     }
 
     /// Tag inventory: every tag from frontmatter and body, with the number
@@ -272,6 +212,96 @@ impl Notes {
             .collect();
         out.sort_by(|a, b| b.notes.cmp(&a.notes).then(a.tag.cmp(&b.tag)));
         Ok(out)
+    }
+}
+
+/// Vault-wide link resolution tables, shared by the read-side link graph
+/// and the write-side link rewriter ([`crate::writes`]).
+///
+/// Obsidian matches link targets case-insensitively regardless of
+/// filesystem, so keys are lowercased. Two tables: full paths, and
+/// basenames (filename with extension; `.md` files additionally get a key
+/// without their extension so `[[note]]` works).
+pub(crate) struct LinkTables {
+    by_path: HashMap<String, String>,
+    by_basename: HashMap<String, Vec<String>>,
+}
+
+impl LinkTables {
+    /// Builds the tables from the vault's note paths. Duplicate keys
+    /// (paths differing only in case) keep the last entry; the resolution
+    /// rules below then deterministically pick among the candidates.
+    pub(crate) fn build(paths: impl IntoIterator<Item = String>) -> Self {
+        let mut by_path: HashMap<String, String> = HashMap::new();
+        let mut by_basename: HashMap<String, Vec<String>> = HashMap::new();
+        for path in paths {
+            by_path.insert(path.to_lowercase(), path.clone());
+            let file_name = path.rsplit('/').next().unwrap_or(&path).to_string();
+            by_basename
+                .entry(file_name.to_lowercase())
+                .or_default()
+                .push(path.clone());
+            if let Some(stem) = file_name.strip_suffix(".md") {
+                by_basename
+                    .entry(stem.to_lowercase())
+                    .or_default()
+                    .push(path);
+            }
+        }
+        Self {
+            by_path,
+            by_basename,
+        }
+    }
+
+    /// Resolves one wikilink target, mirroring Obsidian's rules:
+    /// - empty targets are intra-note links and never resolve;
+    /// - targets containing `/` are vault-root paths (with or without
+    ///   `.md`, with extension required for attachments);
+    /// - bare names match by filename anywhere in the vault;
+    /// - ambiguity between same-named notes resolves to the shortest
+    ///   path (Obsidian's "shortest path" resolution).
+    pub(crate) fn resolve_wikilink(&self, target: &str) -> Option<String> {
+        let target = target.trim();
+        if target.is_empty() {
+            return None; // intra-note links do not enter the graph
+        }
+        if target.contains('/') {
+            let lower = target.to_lowercase();
+            return self
+                .by_path
+                .get(&lower)
+                .or_else(|| self.by_path.get(&format!("{lower}.md")))
+                .cloned();
+        }
+        let candidates = self.by_basename.get(&target.to_lowercase())?;
+        match candidates.len() {
+            0 | 1 => candidates.first().cloned(),
+            // Shortest path (fewest segments), lexicographic tiebreak for
+            // deterministic output.
+            _ => candidates
+                .iter()
+                .min_by_key(|p| (p.split('/').count(), p.to_string()))
+                .cloned(),
+        }
+    }
+
+    /// Resolves a percent-decoded markdown-link target relative to the
+    /// source note's directory. Markdown links are relative to the note,
+    /// so resolution goes through the full-path table only.
+    pub(crate) fn resolve_md_link(&self, source_dir: &str, decoded: &str) -> Option<String> {
+        let joined = normalize_join(source_dir, decoded);
+        self.by_path.get(&joined.to_lowercase()).cloned()
+    }
+
+    /// Number of files a bare wikilink name could resolve to; the link
+    /// rewriter uses this to decide between a bare name and a full path
+    /// when writing a new target.
+    pub(crate) fn basename_candidates(&self, name: &str) -> usize {
+        self.by_basename
+            .get(&name.to_lowercase())
+            .map(Vec::len)
+            .unwrap_or(0)
     }
 }
 

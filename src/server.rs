@@ -34,6 +34,7 @@ use crate::notes::Notes;
 use crate::search::SearchIndex;
 use crate::sync::{self, SyncSupervisor};
 use crate::vault::Vault;
+use crate::writes::{DailyAction, DailyNoteSettings, PatchOp, WriteOutcome, Writes};
 
 /// Cap on a tool's text response, protecting client context windows from
 /// pathologically large vaults and CLI output.
@@ -45,6 +46,7 @@ pub const MAX_TOOL_OUTPUT: usize = 256 * 1024;
 #[derive(Clone)]
 pub struct ServerContext {
     notes: Arc<Notes>,
+    writes: Arc<Writes>,
     search: Arc<SearchIndex>,
     ob_bin: Arc<str>,
     supervisor: Arc<SyncSupervisor>,
@@ -54,11 +56,13 @@ impl ServerContext {
     pub fn new(
         vault: Vault,
         search: Arc<SearchIndex>,
+        daily: DailyNoteSettings,
         ob_bin: impl Into<Arc<str>>,
         supervisor: Arc<SyncSupervisor>,
     ) -> Self {
         Self {
-            notes: Arc::new(Notes::open(vault)),
+            notes: Arc::new(Notes::open(vault.clone())),
+            writes: Arc::new(Writes::open(vault, daily)),
             search,
             ob_bin: ob_bin.into(),
             supervisor,
@@ -154,6 +158,73 @@ struct SearchNotesArgs {
     prefix: Option<String>,
     /// Maximum number of results to return (1-100, default 20).
     limit: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(default)]
+struct WriteNoteArgs {
+    /// Vault-relative path of the note to create or replace.
+    path: String,
+    /// Full note content. When `frontmatter` is given, this is the body
+    /// only — anything frontmatter-shaped in it would land in the body.
+    content: String,
+    /// Optional YAML frontmatter for the note, without the `---` fences
+    /// (fenced input is accepted and normalized).
+    /// Example: "title: My Note\ntags: [journal, idea]"
+    frontmatter: Option<String>,
+    /// Replace the note if it already exists (default: refuse, so a
+    /// mistaken whole-file write cannot destroy existing work).
+    overwrite: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(default)]
+struct PatchNoteArgs {
+    /// Vault-relative path of the note to edit.
+    path: String,
+    /// One of: "append", "prepend", "insert_at_heading",
+    /// "replace_section".
+    operation: String,
+    /// The text to add. May be empty only for "replace_section", which
+    /// then clears the section's content (the heading line is kept).
+    content: String,
+    /// Target heading (case-insensitive); required for
+    /// "insert_at_heading" and "replace_section".
+    heading: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(default)]
+struct MoveNoteArgs {
+    /// Current vault-relative path of the note (or file).
+    from: String,
+    /// New vault-relative path.
+    to: String,
+    /// Replace the destination if it already exists (default: refuse).
+    overwrite: Option<bool>,
+    /// Rewrite wikilinks and markdown links across the vault that
+    /// pointed at the old path (default: true), like Obsidian's own
+    /// rename behavior.
+    update_links: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(default)]
+struct DeleteNoteArgs {
+    /// Vault-relative path of the note to delete.
+    path: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(default)]
+struct DailyNoteArgs {
+    /// One of: "get" (default), "create", "append".
+    action: Option<String>,
+    /// The day as YYYY-MM-DD. Defaults to today (UTC).
+    date: Option<String>,
+    /// Note content for "create"; the text to append for "append"
+    /// (required for append).
+    content: Option<String>,
 }
 
 #[tool_router(server_handler)]
@@ -323,6 +394,122 @@ impl ObsidianHandler {
     }
 
     #[tool(
+        name = "write_note",
+        description = "Create or overwrite a note, optionally with YAML frontmatter. Refuses to replace an existing note unless overwrite is true."
+    )]
+    async fn write_note(
+        &self,
+        Parameters(args): Parameters<WriteNoteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let outcome = match self.ctx.writes.write_note(
+            &args.path,
+            &args.content,
+            args.frontmatter.as_deref(),
+            args.overwrite.unwrap_or(false),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => return tool_error(e),
+        };
+        commit_write(&self.ctx, outcome)
+    }
+
+    #[tool(
+        name = "patch_note",
+        description = "Edit part of a note: append, prepend, insert under a heading, or replace a heading's section. Existing frontmatter is preserved untouched."
+    )]
+    async fn patch_note(
+        &self,
+        Parameters(args): Parameters<PatchNoteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let operation = match args.operation.as_str() {
+            "append" => PatchOp::Append,
+            "prepend" => PatchOp::Prepend,
+            "insert_at_heading" => PatchOp::InsertAtHeading,
+            "replace_section" => PatchOp::ReplaceSection,
+            other => {
+                return tool_error(format!(
+                    "unknown operation {other:?}; expected append, prepend, insert_at_heading, or replace_section"
+                ));
+            }
+        };
+        let outcome = match self.ctx.writes.patch_note(
+            &args.path,
+            operation,
+            &args.content,
+            args.heading.as_deref(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => return tool_error(e),
+        };
+        commit_write(&self.ctx, outcome)
+    }
+
+    #[tool(
+        name = "move_note",
+        description = "Move or rename a note (or any vault file), optionally updating wikilinks and markdown links across the vault that pointed at the old path."
+    )]
+    async fn move_note(
+        &self,
+        Parameters(args): Parameters<MoveNoteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let outcome = match self.ctx.writes.move_note(
+            &args.from,
+            &args.to,
+            args.overwrite.unwrap_or(false),
+            args.update_links.unwrap_or(true),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => return tool_error(e),
+        };
+        commit_write(&self.ctx, outcome)
+    }
+
+    #[tool(
+        name = "delete_note",
+        description = "Delete a note by moving it to the vault's .trash folder. Recoverable; nothing is permanently removed."
+    )]
+    async fn delete_note(
+        &self,
+        Parameters(args): Parameters<DeleteNoteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let outcome = match self.ctx.writes.delete_note(&args.path) {
+            Ok(outcome) => outcome,
+            Err(e) => return tool_error(e),
+        };
+        commit_write(&self.ctx, outcome)
+    }
+
+    #[tool(
+        name = "daily_note",
+        description = "Work with daily notes: read the day's note, create it, or append to it (creating it when missing). The folder and filename format follow the vault's own daily-notes config."
+    )]
+    async fn daily_note(
+        &self,
+        Parameters(args): Parameters<DailyNoteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let action = match args.action.as_deref().unwrap_or("get") {
+            "get" => DailyAction::Get,
+            "create" => DailyAction::Create,
+            "append" => DailyAction::Append,
+            other => {
+                return tool_error(format!(
+                    "unknown action {other:?}; expected get, create, or append"
+                ));
+            }
+        };
+        let outcome =
+            match self
+                .ctx
+                .writes
+                .daily_note(action, args.date.as_deref(), args.content.as_deref())
+            {
+                Ok(outcome) => outcome,
+                Err(e) => return tool_error(e),
+            };
+        commit_write(&self.ctx, outcome)
+    }
+
+    #[tool(
         name = "sync_status",
         description = "Report Obsidian Headless sync status: daemon supervision state plus `ob sync-status` output."
     )]
@@ -341,6 +528,26 @@ impl ObsidianHandler {
         let outcome = sync::sync_now(&self.ctx.ob_bin, self.ctx.notes.vault().root()).await;
         text(format_supervision("sync", &state, &outcome))
     }
+}
+
+/// Finishes a successful write: refreshes the search index for the
+/// affected paths and renders the outcome's message.
+///
+/// The write already succeeded, so an index failure is a degraded-mode
+/// warning appended to the message, not a tool error — the filesystem
+/// watcher would also converge eventually, but doing it here makes a
+/// write-then-search sequence deterministic without waiting out the
+/// debounce window.
+fn commit_write(ctx: &ServerContext, outcome: WriteOutcome) -> Result<CallToolResult, ErrorData> {
+    let mut message = outcome.message;
+    if !outcome.reindex.is_empty()
+        && let Err(e) = ctx
+            .search
+            .reindex_paths(ctx.notes.vault(), &outcome.reindex)
+    {
+        let _ = writeln!(message, "[warning: search index update failed: {e}]");
+    }
+    text(message)
 }
 
 /// Renders supervision state plus one-shot `ob` output. The raw CLI text is

@@ -87,6 +87,7 @@ impl TestServer {
         let ctx = ServerContext::new(
             Vault::open(&vault_root).expect("vault"),
             search,
+            mcp_obsidian::writes::DailyNoteSettings::default(),
             ob_bin.as_str(),
             supervisor.clone(),
         );
@@ -192,6 +193,11 @@ async fn client_round_trip_over_streamable_http() {
         "get_backlinks",
         "get_outlinks",
         "list_tags",
+        "write_note",
+        "patch_note",
+        "move_note",
+        "delete_note",
+        "daily_note",
         "sync_status",
         "sync_now",
     ] {
@@ -339,6 +345,230 @@ async fn client_round_trip_over_streamable_http() {
         result_text(&result).contains("not found"),
         "got: {}",
         result_text(&result)
+    );
+
+    client.cancel().await.expect("client cancel");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn write_tools_round_trip() {
+    let server = TestServer::start().await;
+    let client = connect(&server.addr, TOKEN)
+        .await
+        .expect("client initialize");
+
+    // Create via the tool; the note is immediately searchable because the
+    // write path refreshes the index synchronously (no debounce wait).
+    let result = client
+        .call_tool(call(
+            "write_note",
+            serde_json::json!({
+                "path": "projects/alpha.md",
+                "content": "# Alpha\n\nThe xylophone plan.\n"
+            }),
+        ))
+        .await
+        .expect("write_note call");
+    assert_ne!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("Created projects/alpha.md"),
+        "got: {}",
+        result_text(&result)
+    );
+    let result = client
+        .call_tool(call(
+            "search_notes",
+            serde_json::json!({ "query": "xylophone" }),
+        ))
+        .await
+        .expect("search call");
+    assert!(
+        result_text(&result).contains("projects/alpha.md"),
+        "got: {}",
+        result_text(&result)
+    );
+
+    // Overwrite protection is a tool-level error.
+    let result = client
+        .call_tool(call(
+            "write_note",
+            serde_json::json!({ "path": "projects/alpha.md", "content": "x" }),
+        ))
+        .await
+        .expect("write_note call");
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("overwrite"),
+        "got: {}",
+        result_text(&result)
+    );
+
+    // Frontmatter + patch: the frontmatter block survives the append.
+    let result = client
+        .call_tool(call(
+            "write_note",
+            serde_json::json!({
+                "path": "projects/beta.md",
+                "content": "body\n",
+                "frontmatter": "title: Beta\ntags: [beta]"
+            }),
+        ))
+        .await
+        .expect("write_note call");
+    assert_ne!(result.is_error, Some(true));
+    let result = client
+        .call_tool(call(
+            "patch_note",
+            serde_json::json!({
+                "path": "projects/beta.md",
+                "operation": "append",
+                "content": "added"
+            }),
+        ))
+        .await
+        .expect("patch_note call");
+    assert_ne!(result.is_error, Some(true));
+    let result = client
+        .call_tool(call(
+            "read_note",
+            serde_json::json!({ "path": "projects/beta.md" }),
+        ))
+        .await
+        .expect("read_note call");
+    let text = result_text(&result);
+    assert!(
+        text.contains("title: Beta") && text.contains("body") && text.contains("added"),
+        "got: {text}"
+    );
+
+    // Move with link rewriting: the linker references beta as a wikilink
+    // and as a relative markdown link.
+    let result = client
+        .call_tool(call(
+            "write_note",
+            serde_json::json!({
+                "path": "projects/linker.md",
+                "content": "See [[beta]] and [b](beta.md).\n"
+            }),
+        ))
+        .await
+        .expect("write_note call");
+    assert_ne!(result.is_error, Some(true));
+    let result = client
+        .call_tool(call(
+            "move_note",
+            serde_json::json!({ "from": "projects/beta.md", "to": "renamed/gamma.md" }),
+        ))
+        .await
+        .expect("move_note call");
+    let text = result_text(&result);
+    assert!(
+        text.contains("Moved projects/beta.md to renamed/gamma.md"),
+        "got: {text}"
+    );
+    assert!(text.contains("projects/linker.md"), "got: {text}");
+    let result = client
+        .call_tool(call(
+            "read_note",
+            serde_json::json!({ "path": "projects/linker.md" }),
+        ))
+        .await
+        .expect("read_note call");
+    let text = result_text(&result);
+    assert!(text.contains("[[gamma]]"), "got: {text}");
+    assert!(text.contains("(../renamed/gamma.md)"), "got: {text}");
+    let result = client
+        .call_tool(call(
+            "get_backlinks",
+            serde_json::json!({ "path": "renamed/gamma.md" }),
+        ))
+        .await
+        .expect("get_backlinks call");
+    assert!(
+        result_text(&result).contains("projects/linker.md"),
+        "got: {}",
+        result_text(&result)
+    );
+
+    // Delete goes to .trash and the note leaves the index.
+    let result = client
+        .call_tool(call(
+            "delete_note",
+            serde_json::json!({ "path": "projects/alpha.md" }),
+        ))
+        .await
+        .expect("delete_note call");
+    assert!(
+        result_text(&result).contains(".trash/alpha.md"),
+        "got: {}",
+        result_text(&result)
+    );
+    let result = client
+        .call_tool(call(
+            "search_notes",
+            serde_json::json!({ "query": "xylophone" }),
+        ))
+        .await
+        .expect("search call");
+    assert!(
+        result_text(&result).contains("No notes match"),
+        "got: {}",
+        result_text(&result)
+    );
+
+    // Daily notes: create, get, append.
+    let result = client
+        .call_tool(call(
+            "daily_note",
+            serde_json::json!({
+                "action": "create",
+                "date": "2026-09-25",
+                "content": "daily marker text\n"
+            }),
+        ))
+        .await
+        .expect("daily_note call");
+    assert!(
+        result_text(&result).contains("Created Daily Notes/2026-09-25.md"),
+        "got: {}",
+        result_text(&result)
+    );
+    let result = client
+        .call_tool(call(
+            "daily_note",
+            serde_json::json!({ "action": "get", "date": "2026-09-25" }),
+        ))
+        .await
+        .expect("daily_note call");
+    assert!(
+        result_text(&result).contains("daily marker text"),
+        "got: {}",
+        result_text(&result)
+    );
+    let result = client
+        .call_tool(call(
+            "daily_note",
+            serde_json::json!({
+                "action": "append",
+                "date": "2026-09-25",
+                "content": "second line"
+            }),
+        ))
+        .await
+        .expect("daily_note call");
+    assert_ne!(result.is_error, Some(true));
+    let result = client
+        .call_tool(call(
+            "daily_note",
+            serde_json::json!({ "action": "get", "date": "2026-09-25" }),
+        ))
+        .await
+        .expect("daily_note call");
+    let text = result_text(&result);
+    assert!(
+        text.contains("daily marker text") && text.contains("second line"),
+        "got: {text}"
     );
 
     client.cancel().await.expect("client cancel");

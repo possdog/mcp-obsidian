@@ -72,7 +72,17 @@ async fn main() {
     // `ob sync-setup` happen out-of-band on the host before startup.
     let root = vault.root().to_path_buf();
     let supervisor = std::sync::Arc::new(SyncSupervisor::start(&config.ob_bin, &root));
-    let ctx = ServerContext::new(vault, search, config.ob_bin.as_str(), supervisor.clone());
+    let daily = mcp_obsidian::writes::DailyNoteSettings {
+        dir: config.daily_notes_dir.clone(),
+        format: config.daily_note_format.clone(),
+    };
+    let ctx = ServerContext::new(
+        vault,
+        search,
+        daily,
+        config.ob_bin.as_str(),
+        supervisor.clone(),
+    );
 
     let cancellation = CancellationToken::new();
     let router = server::router(

@@ -72,6 +72,33 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
   `![[note]]`), body tags, frontmatter tags. Resolves wikilinks to vault
   paths. Computes the link graph for backlinks/outlinks. Link rewriting on
   `move_note` updates both wikilinks and standard markdown links.
+- **writes** — write-side operations (phase 6, as built):
+  - `write_note` — create/overwrite; optional frontmatter argument
+    (fenced or bare YAML, normalized); overwriting an existing note is
+    opt-in (`overwrite=true`).
+  - `patch_note` — append / prepend / insert-at-heading /
+    replace-section; edits are computed on the frontmatter-split body
+    and the original frontmatter block is spliced back byte-identically,
+    so unknown YAML fields survive; non-UTF-8 notes are refused rather
+    than lossily rewritten.
+  - `move_note` — rename plus link rewriting using the byte spans the
+    markdown parsers already return. Wikilinks (anywhere, incl.
+    frontmatter values) and relative markdown links that resolved to the
+    old path are rewritten to the shortest unambiguous form (Obsidian's
+    "shortest path when possible"); headings, blocks, aliases, embeds,
+    and markdown anchors are preserved. The moved note's own relative
+    markdown links and self-links are recomputed from the new directory.
+  - `delete_note` — moves to the vault's `.trash` (never unlinks).
+  - `daily_note` — get / create / append by strict `YYYY-MM-DD` date
+    (default today UTC). Folder and filename format resolve per-field
+    from: explicit config, then the vault's own
+    `.obsidian/daily-notes.json` (a server-internal read, outside the
+    tool sandbox), then conventional folders (`Daily Notes`, `Daily`,
+    `Journal`), then Obsidian's defaults.
+  - Every operation returns the affected paths; the server layer
+    refreshes the search index for them synchronously, so
+    write-then-search is deterministic without waiting for the watcher's
+    debounce window (the watcher still converges as a fallback).
 - **search** — tantivy index stored in a configurable directory.
   Schema (fixed fields):
   - `path` (fast + stored) — vault-relative, unique doc key
@@ -120,7 +147,7 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
 | `DAILY_NOTES_DIR` | auto-detect (`Daily Notes`, `Daily`, `Journal`) | Daily notes folder |
 | `DAILY_NOTE_FORMAT` | `YYYY-MM-DD.md` | Daily note filename format |
 
-## MCP tools (v1, 14 tools)
+## MCP tools (v1, 13 tools)
 
 | Tool | Kind | Description |
 |---|---|---|
@@ -173,8 +200,10 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
 5. ~~**Search** — tantivy index, notify watcher, `search_notes`.~~ — done
    (startup rebuild + debounced incremental updates; 11 unit tests plus
    E2E coverage including live re-indexing).
-6. **Write tools** — `write_note`, `patch_note`, `move_note` (link rewrite),
-   `delete_note`, `daily_note`.
+6. ~~**Write tools** — `write_note`, `patch_note`, `move_note` (link rewrite),
+   `delete_note`, `daily_note`.~~ — done (see the **writes** module above;
+   17 unit tests plus an end-to-end write round trip: create → search →
+   patch → move with link rewrite → delete → daily note).
 7. **Deployment** — Dockerfile (multi-stage, distroless/static), systemd unit,
    README with VPS setup instructions (incl. out-of-band `ob login`).
 

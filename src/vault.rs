@@ -29,6 +29,11 @@ pub enum VaultError {
     Forbidden(String),
     #[error("note not found: {0}")]
     NotFound(String),
+    /// A note whose bytes are not valid UTF-8. Reads fall back to lossy
+    /// conversion, but writes refuse rather than silently replacing
+    /// invalid bytes with U+FFFD (which would mangle the file forever).
+    #[error("note is not valid UTF-8: {0}")]
+    NotUtf8(String),
     #[error("path already exists: {0}")]
     Exists(String),
     #[error(transparent)]

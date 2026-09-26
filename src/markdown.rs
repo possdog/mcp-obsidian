@@ -167,6 +167,9 @@ pub struct MdLink {
     /// Target as written, anchor (`#…`) stripped, NOT yet percent-decoded
     /// or resolved — that needs the containing note's directory.
     pub target: String,
+    /// The anchor portion of the target (`note.md#sec` → `sec`). Kept so
+    /// link rewriting can carry anchors over to the new target.
+    pub anchor: Option<String>,
     /// External targets (http, mailto, …) are reported but should not
     /// enter the link graph.
     pub external: bool,
@@ -182,7 +185,12 @@ pub fn parse_md_links(body: &str) -> Vec<MdLink> {
             let span = caps.get(0).expect("whole match").range();
             let raw_target = &caps[3];
             // Strip a trailing anchor; the graph only cares about files.
-            let anchorless = raw_target.split('#').next().unwrap_or(raw_target);
+            // `split_once` (not `split().next()`) keeps `a#b#c`'s second
+            // `#` inside the anchor instead of truncating it away.
+            let (anchorless, anchor) = match raw_target.split_once('#') {
+                Some((path, anchor)) => (path, Some(anchor.to_string())),
+                None => (raw_target, None),
+            };
             // Anything with a URL scheme is outside the vault. Checking for
             // "://" plus mailto keeps relative paths containing ':' working.
             let external = anchorless.contains("://") || anchorless.starts_with("mailto:");
@@ -190,6 +198,7 @@ pub fn parse_md_links(body: &str) -> Vec<MdLink> {
                 embed: &caps[1] == "!",
                 text: caps[2].to_string(),
                 target: anchorless.to_string(),
+                anchor,
                 external,
                 span,
             }
