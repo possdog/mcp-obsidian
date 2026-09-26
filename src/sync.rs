@@ -223,12 +223,15 @@ pub struct SupervisorState {
     pub last_backoff: Option<Duration>,
 }
 
-/// Handle to the supervised `ob sync --continuous` daemon.
+/// Handle to the supervised `ob sync --continuous` daemon. Cheap to keep
+/// behind an `Arc` and share with the MCP session handlers.
 #[derive(Debug)]
 pub struct SyncSupervisor {
     state: Arc<Mutex<SupervisorState>>,
     shutdown: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    // Taken by `stop()`; a Mutex lets the handle be shared behind an Arc
+    // while still awaiting the task exactly once.
+    task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SyncSupervisor {
@@ -253,7 +256,7 @@ impl SyncSupervisor {
         Self {
             state,
             shutdown,
-            task,
+            task: Mutex::new(Some(task)),
         }
     }
 
@@ -266,19 +269,23 @@ impl SyncSupervisor {
     }
 
     /// Signals the daemon to stop, kills the `ob` child, and waits for the
-    /// supervisor task to finish. Returns the final supervision state (the
-    /// task has ended by then, so its state clone is gone and the remaining
-    /// one can be unwrapped).
-    pub async fn stop(self) -> SupervisorState {
+    /// supervisor task to finish. Returns a snapshot of the final
+    /// supervision state. Idempotent: a second call is a no-op.
+    pub async fn stop(&self) -> SupervisorState {
         let _ = self.shutdown.send(true);
-        if let Err(err) = self.task.await {
+        // Take the handle out of the lock before awaiting, so the (sync)
+        // MutexGuard is never held across an await point.
+        let task = self
+            .task
+            .lock()
+            .expect("supervisor task lock poisoned")
+            .take();
+        if let Some(task) = task
+            && let Err(err) = task.await
+        {
             tracing::warn!(error = %err, "sync supervisor task panicked");
         }
-        match Arc::try_unwrap(self.state) {
-            Ok(state) => state.into_inner().expect("supervisor state lock poisoned"),
-            // Unreachable: the supervise task has exited and dropped its Arc.
-            Err(_) => unreachable!("supervisor state still shared after task exit"),
-        }
+        self.state()
     }
 }
 

@@ -87,9 +87,14 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
 - **sync** — spawns `ob sync --continuous --path <vault>` at startup,
   restarts it with backoff on exit, logs its output. `sync_status` runs
   `ob sync-status` on demand; `sync_now` runs a one-shot `ob sync`.
-- **server** — rmcp `#[tool_router]` handler; axum streamable HTTP listener
-  with a bearer-token auth middleware (constant-time comparison, `AUTH_TOKEN`
-  env). All tools return size-capped output.
+- **server** — rmcp `#[tool_router(server_handler)]` handler (verified
+  against rmcp 3.4.1: the transport is a tower service, nested into an
+  axum router at `/mcp`); axum listener with a bearer-token auth
+  middleware (constant-time comparison, `AUTH_TOKEN` env, 401 +
+  `WWW-Authenticate: Bearer` on failure). Tool responses are text content
+  capped at 256 KiB. Expected failures (missing note, bad path) are
+  tool-level error results so the calling model sees the message. All
+  tools return size-capped output.
 
 ## Configuration
 
@@ -99,6 +104,7 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
 | `INDEX_DIR` | `<vault-parent>/.mcp-obsidian-index/<vault-name>` | Tantivy index location. Kept outside the vault: Obsidian Sync replicates dot-folders, so an in-vault index would sync to every device. |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `AUTH_TOKEN` | (required for HTTP) | Bearer token for MCP clients |
+| `ALLOWED_HOSTS` | unset (validation off) | Comma-separated allowed `Host` headers (rmcp's DNS-rebinding guard). Off by default: the server sits behind a TLS reverse proxy that forwards the public host, and every request already requires the bearer token. Set it when exposing the listener directly. |
 | `OB_BIN` | `ob` | Path to the Obsidian Headless binary |
 | `DAILY_NOTES_DIR` | auto-detect (`Daily Notes`, `Daily`, `Journal`) | Daily notes folder |
 | `DAILY_NOTE_FORMAT` | `YYYY-MM-DD.md` | Daily note filename format |
@@ -175,8 +181,10 @@ terminated by a reverse proxy (Caddy/nginx) in front of the HTTP listener.
 
 ## Open items / risks
 
-- rmcp v3.x exact API surface to be verified against crates.io docs (and the
-  rustdoc MCP, which works once the crates are in this project).
+- ~~rmcp v3.x exact API surface to be verified against crates.io docs~~ —
+  verified against 3.4.1 (rustdoc MCP + crate source, 2026-09): tower
+  `StreamableHttpService` nested into axum, `#[tool_router(server_handler)]`
+  macros, reqwest-backed client transport for tests.
 - Obsidian Headless is an open beta; CLI output parsing for `sync_status`
   should be tolerant to format changes (fall back to raw output).
 - E2EE vaults: password is `ob`'s concern at setup time; nothing needed here.

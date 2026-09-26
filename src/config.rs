@@ -37,6 +37,13 @@ pub struct Config {
     #[arg(long, default_value = "ob", env = "OB_BIN")]
     pub ob_bin: String,
 
+    /// Comma-separated allowed `Host` header values (rmcp's DNS-rebinding
+    /// guard). Empty by default: the server is designed to sit behind a TLS
+    /// reverse proxy that forwards the public host, and every request
+    /// already requires the bearer token.
+    #[arg(long, value_delimiter = ',', env = "ALLOWED_HOSTS")]
+    pub allowed_hosts: Option<Vec<String>>,
+
     /// Daily notes folder name (vault-relative). Auto-detected when unset.
     #[arg(long, env = "DAILY_NOTES_DIR")]
     pub daily_notes_dir: Option<String>,
@@ -78,6 +85,7 @@ mod tests {
             bind_addr: String::new(),
             auth_token: None,
             ob_bin: String::new(),
+            allowed_hosts: None,
             daily_notes_dir: None,
             daily_note_format: None,
         };
@@ -98,6 +106,7 @@ mod tests {
             bind_addr: String::new(),
             auth_token: None,
             ob_bin: String::new(),
+            allowed_hosts: None,
             daily_notes_dir: None,
             daily_note_format: None,
         };
