@@ -70,7 +70,8 @@ the binary runs with zero arguments under systemd or Docker.
 
 ## Deploying on a VPS (systemd)
 
-Obsidian Headless login and vault setup happen **out-of-band** — the server
+For a step-by-step runbook (Debian 13, agent-oriented, with verification
+probes), see [DEPLOYMENT.md](DEPLOYMENT.md). Obsidian Headless login and vault setup happen **out-of-band** — the server
 never sees your Obsidian credentials, only `ob` does.
 
 ```sh
