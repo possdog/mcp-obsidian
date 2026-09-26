@@ -1,0 +1,8 @@
+# Keep the build context (and the COPY layers) to what the compiler needs.
+.git
+.gitignore
+deploy
+PLAN.md
+README.md
+target
+tests

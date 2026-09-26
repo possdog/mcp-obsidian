@@ -1,0 +1,50 @@
+# mcp-obsidian systemd unit.
+#
+# Install:
+#   sudo cp deploy/mcp-obsidian.service /etc/systemd/system/
+#   sudo cp deploy/mcp-obsidian.env.example /etc/mcp-obsidian/env  # then edit
+#   sudo chmod 600 /etc/mcp-obsidian/env
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mcp-obsidian
+#
+# Adjust ReadWritePaths below to match VAULT_PATH and INDEX_DIR from the
+# environment file; with ProtectSystem=strict, anything not listed there is
+# read-only to the server.
+
+[Unit]
+Description=MCP server exposing an Obsidian vault (synced by Obsidian Headless)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Dedicated unprivileged user. `ob` also runs as this user, and its auth
+# token lives in this user's home (~/.config/obsidian-headless), so run
+# `ob login` and `ob sync-setup` once as this user before starting the unit.
+User=obsidian
+Group=obsidian
+
+# Fill this file from deploy/mcp-obsidian.env.example (mode 600).
+EnvironmentFile=/etc/mcp-obsidian/env
+
+# The binary reads no CLI arguments; all configuration is env-driven.
+ExecStart=/usr/local/bin/mcp-obsidian
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening. Note that ProtectHome is deliberately NOT set: the vault and
+# the `ob` credentials may live under /home, and both the server and `ob`
+# must be able to read/write there.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/mcp-obsidian/vault /var/lib/mcp-obsidian
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

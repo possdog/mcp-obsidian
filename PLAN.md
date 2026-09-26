@@ -204,10 +204,15 @@ for search re-indexing — one event pipeline for remote pulls and local writes.
    `delete_note`, `daily_note`.~~ — done (see the **writes** module above;
    17 unit tests plus an end-to-end write round trip: create → search →
    patch → move with link rewrite → delete → daily note).
-7. **Deployment** — Dockerfile (multi-stage, distroless/static), systemd unit,
-   README with VPS setup instructions (incl. out-of-band `ob login`).
+7. ~~**Deployment** — Dockerfile (multi-stage), systemd unit, README with
+   VPS setup instructions (incl. out-of-band `ob login`).~~ — done. The
+   runtime image deviates from the distroless/static sketch on purpose:
+   the server supervises `ob` (a Node 22+ CLI) as a child process, so the
+   runtime stage is `node:22-alpine` with `obsidian-headless` installed
+   and the musl-linked server binary; a shell-free distroless image cannot
+   host `ob`. Docker build not verified (no Docker on the dev machine).
 
-## Deployment sketch (phase 7)
+## Deployment (phase 7, as built)
 
 ```sh
 # On the VPS, once, out-of-band:
@@ -221,6 +226,23 @@ mcp-obsidian --vault-path ~/vault --auth-token "$TOKEN"
 
 Clients (Vibe Work, etc.) connect over HTTPS with the bearer token. TLS is
 terminated by a reverse proxy (Caddy/nginx) in front of the HTTP listener.
+
+Artifacts:
+
+- `Dockerfile` — multi-stage: `rust:1-alpine` build (musl, stub-source
+  dependency-caching layer) → `node:22-alpine` runtime with
+  `obsidian-headless` installed, non-root `node` user (UID 1000),
+  `XDG_CONFIG_HOME=/config` so `ob` credentials persist on a mounted volume.
+- `deploy/mcp-obsidian.service` — systemd unit: dedicated user, environment
+  file at `/etc/mcp-obsidian/env`, `ProtectSystem=strict` with explicit
+  `ReadWritePaths` (ProtectHome deliberately unset: `ob` credentials may
+  live under `/home`).
+- `deploy/mcp-obsidian.env.example` — commented environment file.
+- `README.md` — VPS/systemd and Docker setup, reverse-proxy snippets
+  (Caddy `flush_interval -1`, nginx `proxy_buffering off` for SSE),
+  client connection, security notes.
+
+The project plan is now complete; all seven phases are done.
 
 ## Open items / risks
 
